@@ -19,7 +19,7 @@
 
 project = 'py4dstem'
 copyright = '2020, The py4DSTEM team, incl. Ben Savitzky, Steven Zeltmann, Luis DaCosta, Hamish Brown, Philipp Pelz, Edward Bernard, Thomas Pekin, Matthew Henderson, Shreyas Cholia, and Colin Ophus. Full author list at github.'
-author = 'The py4DSTEM team, incl. Ben Savitzky, Steven Zeltmann, Luis DaCosta, Hamish Brown, Philipp Pelz, Edward Bernard, Thomas Pekin, Matthew Henderson, Shreyas Cholia, and Colin Ophus. Full author list at github.'
+author = 'The py4DSTEM team, incl. Ben Savitzky, Steven Zeltmann, Luis DaCosta, Hamish Brown, Philipp Pelz, Edward Bernard, Thomas Pekin, Matthew Henderson, Shreyas Cholia, and Colin Ophus. Full author list at github.com/py4dstem/py4DSTEM/contributors'
 
 # The full version, including alpha/beta/rc tags
 release = '0.9.9'
