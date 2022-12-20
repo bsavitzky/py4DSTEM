@@ -1,6 +1,7 @@
 # BraggVectors methods
 
 import numpy as np
+from py4DSTEM import tqdmnd
 from py4DSTEM.io.datastructure.emd import Metadata
 
 
@@ -578,19 +579,39 @@ def remove_peaks_circle(
         (BraggVectors)
 
     """
-    disks_copy = disks.copy()
+    # parse geometry
+    try:
+        (x0,y0),R = geometry
+    except ValueError:
+        raise Exception("geometry must be a tuple ((x0,y0),R)")
 
-    import numpy as np
-    for rx,ry in py4DSTEM.tqdmnd(disks_copy.shape[0],disks_copy.shape[1]):
-        p = disks_copy._v_uncal[rx,ry]
-        x,y = p['qx'],p['qy']
-        r = np.hypot(x-center_guess[0],y-center_guess[1])
-        delmask = r>maxdist
-        p.remove(delmask)
-        
-    bvm_copy = disks_copy.get_bvm(mode='raw')
+    # copy disks, if applicable
+    disks = self.copy() if copy else self
 
-    return
+    # find and remove disks: uncalibrated case
+    if not cal:
+        for rx,ry in tqdmnd(disks.shape[0],disks.shape[1]):
+            p = disks._v_uncal[rx,ry]
+            x,y = p['qx'],p['qy']
+            r = np.hypot(x-x0,y-y0)
+            delmask = r>R
+            p.remove(delmask)
+        # check if calibrated disks were present and if so, recompute
+        # TODO
+
+    # find and remove disks: calibrated case
+    else:
+        for rx,ry in tqdmnd(disks.shape[0],disks.shape[1]):
+            p_cal = disks._v_cal[rx,ry]
+            p_uncal = disks._v_uncal[rx,ry]
+            x,y = p_cal['qx'],p_cal['qy']
+            r = np.hypot(x-x0,y-y0)
+            delmask = r>R
+            p_uncal.remove(delmask)
+        # recompute calibrated disks
+        # TODO
+
+    return disks
 
 
 
