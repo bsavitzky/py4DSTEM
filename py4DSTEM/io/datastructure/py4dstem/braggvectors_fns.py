@@ -399,7 +399,10 @@ def add_indices_to_braggpeaks(
         return bragg_peaks_indexed
 
 
-def fit_lattice_vectors_all_DPs(self, returncalc = False):
+def fit_lattice_vectors_all_DPs(
+    self,
+    returncalc = False
+    ):
     """
     Fits lattice vectors g1,g2 to each diffraction pattern in braggpeaks, given some
     known (h,k) indexing.
@@ -413,7 +416,11 @@ def fit_lattice_vectors_all_DPs(self, returncalc = False):
     if returncalc:
         return g1g2_map
 
-def get_strain_from_reference_region(self, mask, returncalc = False):
+def get_strain_from_reference_region(
+    self,
+    mask,
+    returncalc = False
+    ):
     """
     Gets a strain map from the reference region of real space specified by mask and the
     lattice vector map g1g2_map.
@@ -436,7 +443,11 @@ def get_strain_from_reference_region(self, mask, returncalc = False):
         return strainmap_median_g1g2
 
 
-def get_strain_from_reference_g1g2(self, mask, returncalc = False):
+def get_strain_from_reference_g1g2(
+    self,
+    mask,
+    returncalc = False
+    ):
     """
     Gets a strain map from the reference lattice vectors g1,g2 and lattice vector map
     g1g2_map.
@@ -458,7 +469,13 @@ def get_strain_from_reference_g1g2(self, mask, returncalc = False):
     if returncalc:
         return strainmap_reference_g1g2
 
-def get_rotated_strain_map(self, mode, g_reference = None, returncalc = True, flip_theta = False):
+def get_rotated_strain_map(
+    self,
+    mode,
+    g_reference = None,
+    returncalc = True,
+    flip_theta = False
+    ):
     """
     Starting from a strain map defined with respect to the xy coordinate system of
     diffraction space, i.e. where exx and eyy are the compression/tension along the Qx
@@ -490,6 +507,90 @@ def get_rotated_strain_map(self, mode, g_reference = None, returncalc = True, fl
 
     if returncalc:
         return strainmap
+
+
+
+
+
+# Methods to modify peaks
+
+
+
+def crop(
+    self,
+    lims,
+    copy = False
+    ):
+    """
+    Crops a Bragg peaks instance in real space.
+
+    Args:
+        lims (4-tuple of ints): the cropping limits (Rx_min,Rx_max,Ry_min,Ry_max)
+        copy (bool): if True, creates and returns a copy of the BraggVectors instance,
+            leaving the original unmodified.  If False, crops and returns the original
+            instance.
+
+    Returns:
+        (BraggVectors)
+    """
+    return
+
+
+def remove_peaks_mask(
+    self,
+    mask,
+    copy = False
+    ):
+    """
+    Removes peaks using a boolean mask.
+
+    Args:
+        mask (boolean array): must be diffraction space shaped. Removes peaks in
+            pixels where mask is True
+        copy (bool): if True, creates and returns a copy of the BraggVectors instance,
+            leaving the original unmodified.  If False, crops and returns the original
+            instance.
+
+    Returns:
+        (BraggVectors)
+    """
+    return
+
+
+def remove_peaks_circle(
+    self,
+    geometry,
+    cal = False,
+    copy = False
+    ):
+    """
+    Removes peaks outside of a circle.
+
+    Args:
+        geometry (tuple): specifies ((center_x,center_y),radius) of the circle
+        cal (bool): indicates whether `geometry` refers to the calibrated (if True)
+            or uncalibrated (if False) peak positions
+        copy (bool): if True, creates and returns a copy of the BraggVectors instance,
+            leaving the original unmodified.  If False, crops and returns the original
+            instance.
+
+    Returns:
+        (BraggVectors)
+
+    """
+    disks_copy = disks.copy()
+
+    import numpy as np
+    for rx,ry in py4DSTEM.tqdmnd(disks_copy.shape[0],disks_copy.shape[1]):
+        p = disks_copy._v_uncal[rx,ry]
+        x,y = p['qx'],p['qy']
+        r = np.hypot(x-center_guess[0],y-center_guess[1])
+        delmask = r>maxdist
+        p.remove(delmask)
+        
+    bvm_copy = disks_copy.get_bvm(mode='raw')
+
+    return
 
 
 
