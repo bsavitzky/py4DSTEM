@@ -1088,11 +1088,11 @@ class DataCube(
         )
 
         # Add to tree
-        self.attach( mask_beamstop )
+        self.attach( x )
 
         # return
         if returncalc:
-            return mask_beamstop
+            return x
 
 
 
