@@ -762,6 +762,8 @@ class BraggFinder(object):
                     "_calling_class": __class__.__name__,
                 } | params,
             )
+            vectors.metadata['gen_params']['template'] = template.probe
+            vectors.metadata['gen_params']['template_FourKern'] = template.kernel
             self.braggvectors = vectors
 
         # Show
