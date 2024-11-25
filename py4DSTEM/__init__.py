@@ -46,6 +46,7 @@ from py4DSTEM.process import phase
 from py4DSTEM.process.polar import PolarDatacube
 from py4DSTEM.process.strain.strain import StrainMap
 from py4DSTEM.process import wholepatternfit
+from py4DSTEM.acchoo import ACCHOO
 
 
 ### Config

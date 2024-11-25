@@ -2,28 +2,36 @@ import numpy as np
 from scipy.spatial import Voronoi
 
 
-def get_voronoi_vertices(voronoi, nx, ny, dist=10):
+def get_voronoi_vertices(voronoi, nx, ny, dist=10, sort=True):
     """
     From a scipy.spatial.Voronoi instance, return a list of ndarrays, where each array
-    is shape (N,2) and contains the (x,y) positions of the vertices of a voronoi region.
+    is shape (N,2) and contains the (x,y) positions of the voronoi region seeds.
 
     The problem this function solves is that in a Voronoi instance, some vertices outside
     the field of view of the tesselated region are left unspecified; only the existence
-    of a point beyond the field is referenced (which may or may not be 'at infinity').
-    This function specifies all points, such that the vertices and edges of the
-    tesselation may be directly laid over data.
+    of a point beyond the field is referenced. This function specifies all pionts, to
+    enable tesselation edge overlays.
 
-    Args:
-        voronoi (scipy.spatial.Voronoi): the voronoi tesselation
-        nx (int): the x field-of-view of the tesselated region
-        ny (int): the y field-of-view of the tesselated region
-        dist (float, optional): place new vertices by extending new voronoi edges outside
-            the frame by a distance of this factor times the distance of its known vertex
-            from the frame edge
+    Parameters
+    ----------
+    voronoi : scipy.spatial.Voronoi
+        the voronoi tesselation
+    nx : int
+        x field-of-view
+    ny : int
+        y field-of-view
+    dist : float
+        place new vertices by extending new voronoi edges outside the frame
+        by a distance of this factor times the distance of its known vertex
+        from the frame edge
+    sort : bool
+        if True, sort the output list before returning so that the order of the
+        regions inscribed matches that of the seed points
 
-    Returns:
-        (list of ndarrays of shape (N,2)): the (x,y) coords of the vertices of each
-        voronoi region
+    Returns
+    -------
+    list of arrays of shape (N,2)
+        the (x,y) coords of the vertices of each voronoi region
     """
     assert isinstance(
         voronoi, Voronoi
@@ -117,6 +125,34 @@ def get_voronoi_vertices(voronoi, nx, ny, dist=10):
         # Update vertex list with this region's vertices
         vertex_list.append(vertices)
 
+    # remove empty list
+    rm = []
+    for idx,vertex in enumerate(vertex_list):
+        if len(vertex)==0:
+            rm.append(idx)
+    while len(rm)>0:
+        idx = rm.pop()
+        vertex_list.pop(idx)
+
+    # sort the vertices list to match the order of the seed points
+    if sort:
+        vlorder = []
+        for idx,vertex in enumerate(vertex_list):
+            com = np.mean(vertex,axis=0)
+            seed_idx = np.argmin(np.hypot(voronoi.points[:,0]-com[0],voronoi.points[:,1]-com[1]))
+            vlorder.append(seed_idx)
+        vlorder = np.array(vlorder)
+        vltemp = []
+        for idx in range(len(vertex_list)):
+            try:
+                jdx = np.where(vlorder==idx)[0][0]
+                vltemp.append(vertex_list[jdx])
+            except IndexError:
+                # catch for errors in tesselation...
+                vltemp.append(None)
+        vertex_list = vltemp
+
+    # return
     return vertex_list
 
 
