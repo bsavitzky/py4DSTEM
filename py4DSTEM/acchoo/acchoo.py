@@ -12,24 +12,58 @@ from py4DSTEM.visualize import show, show_points, add_vector
 
 class ACCHOO:
     """
-    implements the ACCHOO algorithm. usage:
+    ACCHOO is an Apt Crystal Classification Heuristic Old-fashioned Optimizer.
+    It finds crystals from a calibrated BraggVectors instance.
 
-    import ACCHOO
-    a = ACCHOO(disks)             # type=BraggVectors
-    a.get_kpoints(...)
-    a.show_voronoi(...)
-    a.label_empty_pixels(...)
-    a.clean_empty_pixels(...)
-    a.run()
-    a.show_result()
+    ACCHOO is a manner of clustering algorithm. Here, clustering
+    means grouping the pixels into sets that belong together according to some
+    similarity measure.  Whereas typically each pixel would be clustered into
+    a single group, here, ACCHOO seeks to identify sets of pixels which all
+    contain a particular crystal.  Because STEM is a transmission imaging
+    method, each pixel may include multiple crystals which overlapped in the
+    path of the electron beam.  ACCHOO's output is a some number of crystals N,
+    each described by one or two basis vectors (off- or on-axis, respectively)
+    and a boolean mask.
 
-    Label meanings are:
-    0 = unlabelled
-    1 = labelled by current path
-    2 = labelled
-    3 = change from current path
-    4 = change from a path
+    ACCHOO is a heuristic. After labelling non-crystalline pixels it selects
+    a seed point, guesses the crystals present by combination of simple basis
+    vector sets, then explores adjacent pixels with a walker algorithm which
+    defines the connected set of pixels in which the data is well described by
+    this crystal basis set and its boundary.  A boundary pixel is selected as
+    a new seed, a new crystal basis is determined by growing or removing crystals
+    from the prior basis or by adding new crystals as appropriate to the data,
+    and the walker algorithm explores, iterating until every pixel is accounted
+    for. It is old-fashioned in that it contains no training or models, as is
+    the nature of heuristics - it seeds, walks, spawns, evaluates, and labels.
+    It finds crystal basis sets quickly by simplifying the data basis such that
+    cost evaluations are fast, memory use is light, and bases are quickly
+    searchable by exhaustion through small combinations.
+
+    Basic usage:
+
+    >>> import ACCHOO
+    >>> a = ACCHOO(disks)
+    >>> a.get_kpoints(...)          # set bragg maxima, defining dataset channels
+    >>> a.show_voronoi(...)         # show the division of diffraction space
+    >>> a.label_empty_pixels(...)   # label empty pixels
+    >>> a.clean_empty_pixels(...)
+    >>> a.run()                     # run. find and label all crystals
+    >>> a.labels                    # show completion labels
+    >>> seed = a.seeds[i]           # the i'th path's seed coordinate
+    >>> a.show_path(i)              # show the i'th path
+    >>> a.show_data_mask_compare(c) # show the basis and datapoints at coord c
+
+    The label meanings are:
+    0 = unknown
+    1 = current path
+    2 = complete
+    3 = current seed - can remove
+    4 = current seed - can add
+    5 = upcoming seed - can remove
+    6 = upcoming seed - can add
     """
+    ####### Set Up #######
+
     def __init__(
         self,
         disks,
@@ -44,7 +78,9 @@ class ACCHOO:
         num_lowq=3,
         num_highi=1,
         a_scale=1,
-        store_xtalforms=True,
+        cost_thresh=-1e6,
+        verbose=True,
+        datacube=None
         ):
         """
         Parameters
@@ -80,12 +116,20 @@ class ACCHOO:
             data points
         a_scale : number
             scale `a` in the cost function (missed data point weight)
-        store_xtalforms : bool
-            toggles storing an array describing for each path's coverage
+        cost_thresh : number
+            the cost threshold
+        verbose : bool
+            toggles verbosity
+        datacube : DataCube
+            enables side-by-side diffraction pattern / results visualizations
         """
+        self._verbose = verbose
+        if self._verbose:
+            print("Setting up...")
         self._setup_disks(disks,upsample)
         self._reset_path_vars()
         self._setup()
+        self._datacube = datacube
         self.set_min_points_empty(min_points_empty)
         self.set_min_points(min_points)
         self.set_min_inten_empty(min_inten_empty)
@@ -96,7 +140,7 @@ class ACCHOO:
         self.set_num_lowq(num_lowq)
         self.set_num_highi(num_highi)
         self.set_a_scale(a_scale)
-        self.set_store_xtalforms(store_xtalforms)
+        self.set_cost_thresh(cost_thresh)
 
     def _setup_disks(self, disks, upsample=1):
         self.d = disks
@@ -107,68 +151,27 @@ class ACCHOO:
         self._pos = 0
         self._dirs = []
         self._coords = []
+        self._path_crystals = []
+        self._path_mask = []
+        self._path_crystal_indices = []
 
     def _setup(self):
         s = self.shape
         self.labels = np.zeros(s,dtype=int)
-        self.empty = np.zeros(s,dtype=bool)
+        self.noncrystalline = np.zeros(s,dtype=bool)
         self.state_crystals = [[[] for y in range(s[1])] for x in range(s[0])]
         self.state_masks = [[[] for y in range(s[1])] for x in range(s[0])]
         self.seeds = []
+        self.paths = []
         self.crystals = []
-        self.crystal_seeds = []
-        self.crystalforms = []
+        self.crystal_images = []
+        self.crystal_masks = []
+        self._crystal_is_known = []
         self._scores=np.ones(s,dtype=float)
         self._score_caps=np.ones(s,dtype=int)
         self._labelled_empties = False
-
-    # convenience properties and setters
-    @property
-    def N(self):
-        return len(self._voronoi.points)
-    @property
-    def qpixsize(self):
-        return self.d.calibration.get_Q_pixel_size()/self.upsample
-    @property
-    def shape(self):
-        return self.d.shape
-
-    # param setters
-    def set_min_points_empty(self,min_points_empty):
-        self.min_empty = min_points_empty
-    def set_min_points(self,min_points):
-        self.min = min_points
-    def set_min_inten_empty(self,min_inten_empty):
-        self.thresh_empty = min_inten_empty
-    def set_min_inten(self,min_inten):
-        self.thresh = min_inten
-    def set_dist_frac_tol(self,dist_frac_tol):
-        self.distance_frac_tolerance = dist_frac_tol
-    def set_numb_frac_tol(self,numb_frac_tol):
-        self.number_frac_tolerance = numb_frac_tol
-    def set_seed_picker(self,seed_picker):
-        assert(seed_picker in ['max','most','random','front','back',]), f"Unknown value for seed picker {seed_picker}!"
-        self.seed_picker = seed_picker
-        # for "maximum" picker, perform calc upfront
-        if seed_picker=='max':
-            self._inten_tot = np.zeros(self.shape)
-            for rx in range(self.shape[0]):
-                for ry in range(self.shape[1]):
-                    if len (self.d.cal[rx,ry].data)>1:
-                        self._inten_tot[rx,ry] = np.sum(self.d.cal[rx,ry].data['intensity'][1:])
-        elif seed_picker=='most':
-            self._n_data_points = np.zeros(self.shape)
-            for rx in range(self.shape[0]):
-                for ry in range(self.shape[1]):
-                    self._n_data_points[rx,ry] = len(self.d.cal[rx,ry].data['intensity'])
-    def set_num_lowq(self,num_lowq):
-        self._num_lowq = num_lowq
-    def set_num_highi(self,num_highi):
-        self._num_highi = num_highi
-    def set_a_scale(self,a_scale):
-        self._a_scale = a_scale
-    def set_store_xtalforms(self,store_xtalforms):
-        self.store_xtalforms = store_xtalforms
+        self._rmable_index = -1*np.ones(s,dtype=int)
+        self._final_crystal_merge = []
 
     # Set data channels
     def get_kpoints(self, p, vp={}, show=True):
@@ -220,159 +223,20 @@ class ACCHOO:
             )
 
         # Set up masks libraries
-        self._masks_library_1D = [None for idx in range(self.N)]
-        self._masks_library_2D = [[None for idx in range(self.N)] for jdx in range(self.N)]
-
-    # visualization methods
-    def show_labels(self,
-        cmap='inferno',
-        c_amorph='cornflowerblue',
-        vp={'vmin':0,'vmax':4},
-        returnfig=False,
-        ):
-        fig,ax = show(self.labels,mask=~self.empty,
-            mask_color=c_amorph,cmap=cmap,returnfig=True, **vp)
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
-
-    def show_xtalform(self,
-        idx,
-        cmap='inferno',
-        c_amorph='cornflowerblue',
-        c_seed='springgreen',
-        marker='x',
-        vp={'vmin':0,'vmax':2},
-        returnfig=False,
-        ):
-        coord = self.seeds[idx]
-        ar = self.crystalforms[idx]
-        print(f'Showing form seeded at {coord}')
-        fig,ax = show(ar,mask=~self.empty,
-            mask_color=c_amorph,cmap=cmap,returnfig=True, **vp)
-        ax.scatter(coord[1],coord[0],color=c_seed,marker=marker)
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
-
-    def show_voronoi(self,c='w',lw=1,vp={},returnfig=False):
-        # Show
-        fig,ax = show_points(
-            self.bvm,
-            x=self._qx,
-            y=self._qy,
-            open_circles=True,
-            returnfig=True,
-            **vp
-        )
-        for region in range(len(self._voronoi_vertices)):
-            vertices_curr = self._voronoi_vertices[region]
-            if vertices_curr is not None:
-                for i in range(len(vertices_curr)):
-                    x0,y0 = vertices_curr[i,:]
-                    x1,y1 = vertices_curr[(i+1)%len(vertices_curr),:]
-                    ax.plot((y0,y1),(x0,x1),c,lw=lw)
-        ax.set_xlim([0,self.bvm.data.shape[1]])
-        ax.set_ylim([0,self.bvm.data.shape[0]])
-        plt.gca().invert_yaxis()
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
-
-    def show_voronoi_mask(self,mask,mask_alpha=0.4,mask_color='y',
-        c='lightcyan',lw=0.5,vp={},returnfig=False):
-        """ mask is a list of integer (voronoi regions)
-        """
-        patches = []
-        fig,ax = self.show_voronoi(c=c,lw=lw,vp=vp,returnfig=True)
-        for idx in mask:
-            vertices_curr = self._voronoi_vertices[idx]
-            if vertices_curr is not None:
-                vert = np.roll(vertices_curr,-1,1)
-                patches.append(Polygon(vert))
-        p = PatchCollection(patches,alpha=mask_alpha,color=mask_color)
-        ax.add_collection(p)
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
-
-    def show_data_mask_compare(self,coord,mask_alpha=0.4,mask_color='y',
-        c='lightcyan',lw=0.5,marker='x',markercolor='blue',markersize=100,
-        vectors=False,vect_cmap='cool',vect_width=0.5,vect_headsize=6,vectp={},
-        vp={},returnfig=False):
-        """ show the data points, mask, voronoi, bvm overlaid
-        """
-        rx,ry = coord
-        mask = self.state_masks[rx][ry]
-        fig,ax = self.show_voronoi_mask(
-            mask = mask,
-            c = c,
-            lw = lw,
-            vp = vp,
-            mask_alpha=0.4,
-            returnfig=True
-        )
-        qpixsize = self.d.calibration.get_Q_pixel_size()
-        origin = self.d.calibration.get_origin_mean()
-        d = self.d.cal[rx,ry].data
-        x,y = d['qx'],d['qy']
-        x,y = self._transform_cal_to_pix(x,y)
-        ax.scatter(y,x,color=markercolor,s=markersize,marker=marker)
-        # if vectors were requested, add them
-        if vectors:
-            # set up vectors
-            crystals = self.state_crystals[coord[0]][coord[1]]
-            crystals_vectors = []
-            for xtal in crystals:
-                if len(xtal)==1:
-                    i = xtal[0]
-                    x,y = self.qx[i],self.qy[i]
-                    x,y = self._transform_cal_to_pix(x,y)
-                    crystals_vectors.append(((x,y),))
-                elif len(xtal)==2:
-                    i,j = xtal[0],xtal[1]
-                    x1,y1 = self.qx[i],self.qy[i]
-                    x1,y1 = self._transform_cal_to_pix(x1,y1)
-                    x2,y2 = self.qx[j],self.qy[j]
-                    x2,y2 = self._transform_cal_to_pix(x2,y2)
-                    crystals_vectors.append(((x1,y1),(x2,y2)))
-            # set up colors
-            l = len(crystals_vectors)
-            cm = plt.get_cmap(vect_cmap)
-            colors = [cm(n/l) for n in range(l)]
-            # plot vectors
-            origin = self.d.calibration.get_origin_mean()
-            origin=tuple([x*self.upsample for x in origin])
-            for xtalvs,color in zip(crystals_vectors,colors):
-                for v in xtalvs:
-                    add_vector(ax,d=dict({
-                        'x0':origin[0],
-                        'y0':origin[1],
-                        'vx':v[0]-origin[0],
-                        'vy':v[1]-origin[1],
-                        'color':color,
-                        'width':vect_width,
-                        'head_width':vect_headsize,
-                    }, **vectp))
-            print(f"crystal channels: {crystals}")
-        # return
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
+        self._masks_library_1D = [None for idx in range(self.C)]
+        self._masks_library_2D = [[None for idx in range(self.C)] for jdx in range(self.C)]
 
 
-    ####### core algorithm methods #######
+    ####### Core Algorithm Methods #######
 
     def run(self):
         if not self._labelled_empties:
+            if self._verbose:
+                print("Empty pixels haven't been cleaned. Cleaning...")
             self.label_empty_pixels()
             self.clean_empty_pixels()
-        print('entering seed loop...')
+        if self._verbose:
+            print("Entering seed loop...")
         go_forth = True
         while go_forth:
             go_forth = self._seedloop()
@@ -381,16 +245,19 @@ class ACCHOO:
     def _seedloop(self):
         # pick a seed...
         l0 = np.sum(self.labels==0)
-        l4 = np.sum(self.labels==4)
-        # ...from an unassessed pixel
+        l5 = np.sum(self.labels==5)
+        l6 = np.sum(self.labels==6)
+        # ...from an unknown pixel
         if l0>0:
             seed = self._new_seed(seed_picker=self.seed_picker)
+            if self._verbose:
+                print(f'Setting out at seed {seed}')
             self._reset_path_vars()
-            #print(f'setting out at seed {seed}')
             self._new_path(seed)
             return True
         # ...from a seeded pixel
-        elif l4>0:
+        # ...i think we may not get here. we'll see.
+        elif l5+l6>0:
             print('seeded path!')
             print('need to make this still - ending...')
             return False # TODO
@@ -403,6 +270,8 @@ class ACCHOO:
             if not(np.all(self.labels==2)):
                 warnings.warn("Warning: finished but not all pixels have been labelled 'complete'")
             return False
+        if self._verbose:
+            print("Completed seedloop.")
 
     def _new_seed(self,seed_picker='max'):
         pos = np.where(self.labels==0)
@@ -425,27 +294,48 @@ class ACCHOO:
         return seed
 
     def _new_path(self,seed):
-        """ Setup, then goto _new_path_loop
+        """ Setup data, find new path crystals, go walking.
+        Then spawn seeded paths.
         """
         # setup
-        x,y,inten = self._data_curr = self._get_data(seed)
+        # get data
+        self._data_curr = x,y,inten = self._get_data(seed)
         self._data_channels_curr = self._get_data_channels(x,y)
+        # reset xtal search vars
         self._b_opts_curr = []
         self._crystals_curr = []
         self._crystals_n_opts = 0
         self._best_score_curr = -1e8
-        self._score_cap_curr = 1
-        self._mask_base_curr = [0]  # start with center beam masked
-        #if self.thresh > 0:
-        #    self._mask_base_curr = self._mask_union([self._mask_base_curr,self._get_inten_mask(inten)])
+        self._mask_base_curr = [0]  # mask center beam
         self._mask_curr = self._mask_base_curr
-        # loop, find crystals
-        loop_path = True
-        while loop_path:
-            loop_path = self._new_path_loop(seed)
-        return
+        # loop - find crystals
+        loop = True
+        while loop:
+            if self._verbose:
+                print(f'performing xtal search at {seed}')
+            loop = self._xtal_search_loop(seed)
+        # loop - walk
+        self._put_on_shoes_and_coat(seed)
+        # finalize current path
+        self._finalize_path_and_update_crystals(seed)
+        # check for seeds
+        l34 = np.sum(np.logical_or(self.labels==3,self.labels==4))
+        # enter seeded path loops
+        loop = l34>0
+        while loop:
+            seed = self._pick_seeded_seed(seed_picker=self.seed_picker)
+            if self._verbose:
+                print(f'setting out at a merged seed path at seed {seed}')
+            self._reset_path_vars()
+            seedloop = self._seeded_path(seed)
+            pass
+        # TODO after seeded path loops, all 3/4's have been accounted for
+        # do a finalization - update crystals, labels, path stuff
+        # once 3/4's --> 5/6's, for 5/6s adjacent to current path,
+        # turn back into 3/4s.  Then loop/iterate
+        pass
 
-    def _new_path_loop(self,seed):
+    def _xtal_search_loop(self,seed):
         """ Find a crystal set and mask, then _put_on_shoes_and_coat
         """
         x,y,inten = self._data_curr
@@ -460,7 +350,7 @@ class ACCHOO:
         # check for data, label and exit if there isn't any
         if len(x[m]) < self.min:
             self.labels[seed[0],seed[1]] = 2
-            self.empty[seed[0],seed[1]] = 2
+            self.noncrystalline[seed[0],seed[1]] = 2
             return False
         # find crystals
         # first get basis vector options & new crystal options
@@ -470,20 +360,210 @@ class ACCHOO:
         crystal_opts, mask_opts = self._get_crystal_opts_curr()
         self._score_crystal_options_and_update(crystal_opts,mask_opts)
         # are we done?
-        if self._best_score_curr < -1e6 * self._score_cap_curr:
+        if self._best_score_curr < self._cost_thresh:
             # ...no?  iterate
             return True
         else:
-            # ...yes? finish
-            for xtal in self._crystals_curr:
-                self.crystals.append(xtal)
-                self.crystal_seeds.append(seed)
-            self.state_crystals[seed[0]][seed[1]] = self._crystals_curr
-            self.state_masks[seed[0]][seed[1]] = self._mask_curr
+            # ...yes? store variables and return
+            self._path_crystals = self._crystals_curr
+            self._path_mask = self._mask_curr
             self._scores[seed[0],seed[1]] = self._best_score_curr
             self.labels[seed[0],seed[1]] = 1
-            # done
-            self._put_on_shoes_and_coat(seed)
+            return False
+
+    def _seeded_path(self,seed):
+        """ Setup data, find xtals wrt existing xtals, go walking.
+        """
+        # setup - set data
+        self._data_curr = x,y,inten = self._get_data(seed)
+        self._data_channels_curr = self._get_data_channels(x,y)
+        # reset xtal search vars
+        self._b_opts_curr = []
+        self._crystals_curr = []
+        self._best_score_curr = -1e8
+        self._mask_base_curr = [0]  # mask center beam
+        self._mask_curr = self._mask_base_curr
+        # get label
+        label = self.labels[seed[0],seed[1]]
+        assert(label in (3,4)), "seeded path seed label must be 3 or 4"
+        #  remove or add or add&remove
+        if label == 3:
+            loop = True
+            while loop:
+                loop = self._xtal_search_loop_remove(seed)
+        else:
+            loop = True
+            while loop:
+                loop = self._xtal_search_loop_add(seed)
+        raise Exception('hello dolly')
+        # loop - walk
+        #self._put_on_shoes_and_coat(seed)
+        # finalize current path
+        #self._finalize_path_and_update_crystals(seed) # TODO - does this method need to be different?
+        # check for seeds
+        #l34 = np.sum(np.logical_or(self.labels==3,self.labels==4)) # TODO - finish - how to exit loop?
+
+    def _xtal_search_loop_remove(self,seed):
+        """ Gather xtals and masks from neighbors, then try
+        removing xtals until minimal mask is found. store path xtals and mask
+        """
+        # gather xtals and masks from neighbors
+        xtals = []
+        masks = []
+        coords = [
+            (seed[0]-1,seed[1]),
+            (seed[0],seed[1]-1),
+            (seed[0]+1,seed[1]),
+            (seed[0],seed[1]+1)]
+        s = self.shape
+        for idx in range(3,-1,-1):
+            c = coords[idx]
+            if c[0]<0 or c[0]>=s[0] or c[1]<0 or c[1]>=s[1]:
+                coords.pop(idx)
+        for c in coords:
+            if self.labels[c[0],c[1]] == 2:
+                xtals_curr = self.state_crystals[c[0]][c[1]]
+                for xtal in xtals_curr:
+                    if xtal not in xtals:
+                        xtals.append(xtal)
+                        masks.append(self._get_mask(self.crystals(xtal)))
+        # confirm we found some xtals
+        assert(len(xtals)>0), "this shouldn't be able to happen..."
+        assert(len(xtals)>0), "you can initiate a _new_path_loop instead, but do check labels."
+        # update the current crystals
+        self._crystals_curr = [self.crystals[i] for i in xtals]
+        # try removing xtals
+        loop = True
+        while loop:
+            loop,idx = self._can_remove_crystal(channels)
+            if loop:
+                # remove xtal
+                xtals.pop(idx)
+                masks.pop(idx)
+                self._crystals_curr.pop(idx)
+        # check that cost satisfies thresh
+        channels = self._data_channels_curr
+        mask = self._mask_curr = self._mask_union([self._mask_base_curr]+masks)
+        cost = self._best_score_curr = self._get_cost(channels,self._crystals_curr,mask)
+        assert(cost_composite>self._cost_thresh), 'cost threshold not satisfied - this should not happen here...'
+        # update variables and return
+        self._path_crystals = self._crystals_curr
+        self._path_mask = self._mask_curr
+        self._path_crystal_indices = xtals
+        self._scores[seed[0],seed[1]] = self._best_score_curr
+        self.labels[seed[0],seed[1]] = 1
+        pass
+
+    def _xtal_search_loop_add(self,seed,add=True):
+        """ Gather xtals and masks from neighbors. First, add new crystals until
+        data is accounted for.  Then, try removing crystals. Store path xtals and mask
+        """
+        # gather xtals and masks from neighbors
+        xtals = []
+        masks = []
+        coords = [
+            (seed[0]-1,seed[1]),
+            (seed[0],seed[1]-1),
+            (seed[0]+1,seed[1]),
+            (seed[0],seed[1]+1)]
+        s = self.shape
+        for idx in range(3,-1,-1):
+            c = coords[idx]
+            if c[0]<0 or c[0]>=s[0] or c[1]<0 or c[1]>=s[1]:
+                coords.pop(idx)
+        for c in coords:
+            if self.labels[c[0],c[1]] == 2:
+                xtals_curr = self.state_crystals[c[0]][c[1]]
+                for xtal in xtals_curr:
+                    if xtal not in xtals:
+                        xtals.append(xtal)
+                        masks.append(self._get_mask(self.crystals[xtal]))
+        # confirm we found some xtals
+        assert(len(xtals)>0), "this shouldn't be able to happen..."
+        assert(len(xtals)>0), "you can initiate a _new_path_loop instead, but do check labels."
+        # update the current crystals
+        self._crystals_curr = [self.crystals[i] for i in xtals]
+        # get baseline cost
+        channels = self._data_channels_curr
+        mask = self._mask_curr = self._mask_union([self._mask_base_curr]+masks)
+        cost = self._best_score_curr = self._get_cost(channels,self._crystals_curr,mask)
+        # if cost is above thresh, add crystals
+        self._crystals_n_opts = 0
+        if cost < self._cost_thresh:
+            loop = True
+            while loop:
+                loop = self._xtal_search_loop_add_internal(seed,xtals_curr=self._path_crystal_indices)
+        # try removing xtals
+        loop = True
+        rmved = False
+        while loop:
+            loop,idx = self._can_remove_crystal(channels)
+            if loop:
+                # remove xtal
+                xtals.pop(idx)
+                masks.pop(idx)
+                self._crystals_curr.pop(idx)
+                rmved = True
+        if rmved:
+            # check that cost satisfies thresh
+            channels = self._data_channels_curr
+            mask = self._mask_curr = self._mask_union([self._mask_base_curr]+masks)
+            cost = self._best_score_curr = self._get_cost(channels,self._crystals_curr,mask)
+            assert(cost_composite>self._cost_thresh), 'cost threshold not satisfied - this should not happen here...'
+            # update variables and return
+            self._path_crystals = self._crystals_curr
+            self._path_mask = self._mask_curr
+            self._path_crystal_indices = xtals
+            self._scores[seed[0],seed[1]] = self._best_score_curr
+            self.labels[seed[0],seed[1]] = 1
+            pass
+
+    def _xtal_search_loop_add_internal(self,seed,xtals_curr=[]):
+        """ Find a crystal set and mask, then _put_on_shoes_and_coat
+        """
+        x,y,inten = self._data_curr
+        # prepare boolean mask
+        # length matches datapoints and True indicates unmasked
+        m = np.ones(len(x),dtype=bool)
+        for idx in range(len(x)):
+            if self._data_channels_curr[idx] in self._mask_curr:
+                m[idx] = 0
+            if self._data_channels_curr[idx] in self._b_opts_curr:
+                m[idx] = 0
+        # check for unaccounted data. If none is found, label and exit
+        if len(x[m]) < self.min:
+            # if no xtals existed already, label empty
+            if len(xtals_curr)==0:
+                self.labels[seed[0],seed[1]] = 2
+                self.noncrystalline[seed[0],seed[1]] = 2
+                return False
+            # otherwise, store vars, label, exit
+            else:
+                self._path_crystals = self._crystals_curr
+                self._path_mask = self._mask_curr
+                self._path_crystal_indices = xtals_curr
+                self._scores[seed[0],seed[1]] = self._best_score_curr
+                self.labels[seed[0],seed[1]] = 1
+                return False
+        # find crystals
+        # first get basis vector options & new crystal options
+        # then compute permutation scores and update vars
+        self._crystals_n_opts += 1
+        self._get_b_next_opts(m)
+        crystal_opts, mask_opts = self._get_crystal_opts_curr()
+        self._score_crystal_options_and_update_addxtals(crystal_opts,mask_opts)
+        # are we done?
+        if self._best_score_curr < self._cost_thresh:
+            # ...no?  iterate
+            return True
+        else:
+            # ...yes? store variables and return
+            self._path_crystals = self._crystals_curr
+            self._path_mask = self._mask_curr
+            neg = [-1]*(len(self._path_mask)-len(self._path_crystal_indices))
+            self._path_crystal_indices += neg # label new crystal's indices as -1
+            self._scores[seed[0],seed[1]] = self._best_score_curr
+            self.labels[seed[0],seed[1]] = 1
             return False
 
     def _put_on_shoes_and_coat(self,seed):
@@ -506,17 +586,16 @@ class ACCHOO:
 
     def _walk(self):
         """ look at the label of the pixel ahead.
-        is it 0? new pixel - check for mask change, then walk or turn
+        is it 0 or 4? new pixel / old seed - check for mask change, then walk or turn
         is it 1,2,3 or an edge? turn
-        is it 3? merge seeds, then walk
         """
         d = self._dirs[self._pos]
         c,l = self._look_ahead()
-        # catch for lone pixels
+        # exit catch
         if len(self._coords)==1 and d==3:
             self._single_pixel_shake()
             return False
-        # backtracking
+        # backtrack if we're facing the way we came from
         if len(self._coords)>1:
             if np.array_equal(np.array(c),np.array(self._coords[-2])):
                 return False
@@ -531,274 +610,9 @@ class ACCHOO:
         else:
             raise Exception(f'encountered unexpected label {l}')
 
-    def _seeded_path(self,seed):
-        """ setup variables, gather neighbor xtals & masks, then enter the path loop
-        """
-        # setup - set data
-        x,y,inten = self._data_curr = self._get_data(seed)
-        self._data_channels_curr = self._get_data_channels(x,y)
-        # reset vars
-        self._crystals_curr = []
-        self._best_score_curr = -1e8
-        self._crystal_gen_iters = 0
-        self._score_cap_curr = 1
-        self._mask_base_curr = [0]  # start with center beam masked
-        if self.thresh > 0:
-            self._mask_base_curr = self._mask_union([self._mask_base_curr,self._get_inten_mask(inten)])
-        self._mask_curr = self._mask_base_curr
-        # gather xtals and masks from neighbors
-        xtals = []
-        masks = []
-        coords = [
-            (seed[0]-1,seed[1]),
-            (seed[0],seed[1]-1),
-            (seed[0]+1,seed[1]),
-            (seed[0],seed[1]+1)]
-        s = self.shape
-        for idx in range(3,-1,-1):
-            c = coords[idx]
-            if c[0]<0 or c[0]>=s[0] or c[1]<0 or c[1]>=s[1]:
-                coords.pop(idx)
-        for c in coords:
-            if self.labels[c[0],c[1]] == 2:
-                xtals.append(self.state_crystals[c[0]][c[1]])
-                masks.append(self.state_masks[c[0]][c[1]])
-        # confirm we found some xtals
-        assert(len(xtals)>0), "this shouldn't be able to happen..."
-        assert(len(xtals)>0), "you can initiate a _new_path_loop instead, but do check labels."
-        # prepare mask
-        m = np.ones(len(x),dtype=bool)
-        for idx in range(len(x)):
-            if self._data_channels_curr[idx] in self._mask_curr:
-                m[idx] = 0
-        # check for data, and if there's none label & exit
-        if len(x[m]) < self.min:
-            self.labels[seed[0],seed[1]] = 2
-            self.empty[seed[0],seed[1]] = 2
-            return False
-        # setup crystals & masks from adjacent pixels
-        xtals_compare = []
-        masks_compare = []
-        for _xtals,_masks in zip(xtals,masks):
-            for xtal,mask in zip(_xtals,_masks):
-                if not self._xtal_in_xtals(xtal,xtals_compare):
-                    xtals_compare.append(xtal)
-                    masks_compare.append(mask)
-        # compare and update
-        self._score_crystal_options_and_update(xtals_compare,masks_compare)
-        # for scores above -1e6,
-        # check for excess crystals,
-        # then return
-        if self._best_score_curr > -1e6 * self._score_cap_curr:
-            # remove loop
-            can_remove, idx_rm = self._can_remove_crystal(self._data_channels_curr)
-            while can_remove:
-                self._crystals_curr.pop(idx,rm)
-                can_remove, idx_rm = self._can_remove_crystal(self._data_channels_curr)
-            # finish
-            for xtal in self._crystals_curr:
-                if not self._xtal_in_xtals(xtal, self.crystals):
-                    self.crystals.append(xtal)
-            self.state_crystals[seed[0]][seed[1]] = self._crystals_curr
-            self.state_masks[seed[0]][seed[1]] = self._mask_curr
-            self._scores[seed[0],seed[1]] = self._best_score_curr
-            self.labels[seed[0],seed[1]] = 1
-            # done
-            self._put_on_shoes_and_coat(seed)
-            return False
-        # for scores below -1e6, i.e. missing data points,
-        # is the score within tolerances?
-        # if so try a rm, then return
-        if self._best_score_curr < -1e6 * self._score_cap_curr:
-            all_clear = True
-            channels_unmasked = list(set(self._data_channels_curr)-set(self._mask_curr))
-            channels_unmasked_bool = np.array([c in channels_unmasked for c in self._data_channels_curr])
-            for idx in np.nonzero(channels_unmasked_bool)[0]:
-                # intensity thresh
-                if inten[idx] < self.thresh:
-                    pass
-                # distance tolerance
-                else:
-                    _x,_y = x[idx],y[idx]
-                    _c = channels[idx]
-                    dist_unmasked = np.hypot(_x-self.qx[_c],_y-self.qy[_c])
-                    dist_masked = 1e8
-                    for ch in self._mask_curr:
-                        _d = np.hypot(_x-self.qx[ch],_y-self.qy[ch])
-                        if _d<dist_masked:
-                            dist_masked = _d
-                    dist_frac_tol = dist_masked/dist_unmasked
-                    if dist_frac_tol > self.distance_frac_tolerance:
-                        all_clear = False
-            # number threshold
-            if not all_clear:
-                _frac = len(channels_unmasked)/len(channels)
-                if _frac < self.number_frac_tolerance:
-                    all_clear = True
-            if all_clear:
-                # remove loop
-                can_remove, idx_rm = self._can_remove_crystal(self._data_channels_curr)
-                while can_remove:
-                    self._crystals_curr.pop(idx,rm)
-                    can_remove, idx_rm = self._can_remove_crystal(self._data_channels_curr)
-                # assign labels
-                for xtal in self._crystals_curr:
-                    if not self._xtal_in_xtals(xtal, self.crystals):
-                        self.crystals.append(xtal)
-                self.state_crystals[seed[0]][seed[1]] = self._crystals_curr
-                self.state_masks[seed[0]][seed[1]] = self._mask_curr
-                self._scores[seed[0],seed[1]] = self._best_score_curr
-                self.labels[seed[0],seed[1]] = 1
-                # go walking
-                self._put_on_shoes_and_coat(seed)
-                # return
-                return False
-        # for scores below -1e6 beyond tolerances,
-        # gen a new solution, then return
-        # reset solution vars
-        self._crystals_curr = []
-        self._best_score_curr = -1e8
-        self._crystal_gen_iters = 0
-        self._score_cap_curr = 1
-        self._mask_curr = self._mask_base_curr
-        loop = True
-        while loop:
-            loop = self._seeded_path_internal_loop(seed,x,y,inten,xtals,masks)
-        return
-
-    def _seeded_path_internal_loop(self,seed,x,y,inten,xtals,masks):
-        """ gen new solution if other options fail, then walk
-        """
-        # get basis vector options & new crystal options
-        b_next_opts = self._get_b_next_opts(self._mask_curr) # TODO - mask wrong, needs boolean
-        crystals_opts,mask_opts = self._get_crystal_opts_add(b_next_opts)
-        # compute scores and update
-        self._score_crystal_options_and_update(crystals_opts,mask_opts)
-        # are we done?
-        if self._best_score_curr > -1e6 * self._score_cap_curr:
-            # finish
-            for xtal in self._crystals_curr:
-                if not self._xtal_in_xtals(xtal, self.crystals):
-                    self.crystals.append(xtal)
-            self.state_crystals[seed[0]][seed[1]] = self._crystals_curr
-            self.state_masks[seed[0]][seed[1]] = self._mask_curr
-            self._scores[seed[0],seed[1]] = self._best_score_curr
-            self.labels[seed[0],seed[1]] = 1
-            # done
-            self._put_on_shoes_and_coat(seed)
-            return False
-        else:
-            # iterate
-            self._crystal_gen_iters += 1
-            if self._crystal_gen_iters%10 != 0:
-                return True
-            elif self._crystal_gen_iters != 100:
-                # increase the score cap
-                self._score_cap_curr += 1
-                print(f'increased cap to {self._score_cap_curr}')
-                self._score_caps[seed[0],seed[1]] += 1
-                #  reset the vectors and xtal options
-                self._crystals_curr = []
-                self._mask_curr = self._mask_base_curr
-                self._best_score_curr = -1e8
-                return True
-            else:
-                print('she cant take much more o this, capn')
-                self._anomoly = True
-                self._anom_point = seed
-                raise Exception(f'an unexpected error has occured; the crystal gen algo needs attention')
-                sys.exit()
-                return False
-
-    def _pick_seeded_seed(self,seed_picker='max'):
-        pos = np.where(self.labels==4)
-        n_seeds = len(pos[0])
-        assert(n_seeds>0), "no 3-labelled pixels found when a seeded pixel was requested"
-        assert(seed_picker in ['max','random','front','back'])
-        if seed_picker == 'random':
-            n = np.random.randint(0,n_seeds)
-        elif seed_picker == 'max':
-            maxi = 0
-            for idx in range(len(pos[0])):
-                val = np.sum(self.d.cal[pos[0][idx],pos[1][idx]].data['intensity'])
-                if val>maxi:
-                    maxi = val
-                    n = idx
-        elif seed_picker == 'back':
-            n = -1
-        elif seed_picker == 'front':
-            n = 0
-        else:
-            raise Exception(f"Unknown value for seed picker {seed_picker}")
-        seed = pos[0][n],pos[1][n]
-        return seed
-
-    def _new_pixel(self,coord):
-        """
-        """
-        # get data
-        x,y,inten = self._data_curr = self._get_data(coord)
-        channels = self._get_data_channels(x,y)
-        # get the cost
-        cost = self._get_cost(channels,self._crystals_curr,self._mask_curr)
-        # for scores below -1e6, i.e. missing data points,
-        # are we within tolerances? if so, label & return
-        if cost < -1e6 * self._score_cap_curr:
-            all_clear = True
-            channels_unmasked = list(set(channels)-set(self._mask_curr))
-            channels_unmasked_bool = np.array([c in channels_unmasked for c in channels])
-            for idx in np.nonzero(channels_unmasked_bool)[0]:
-                # intensity thresh
-                if inten[idx] < self.thresh:
-                    pass
-                # distance tolerance
-                else:
-                    _x,_y = x[idx],y[idx]
-                    _c = channels[idx]
-                    dist_unmasked = np.hypot(_x-self.qx[_c],_y-self.qy[_c])
-                    dist_masked = 1e8
-                    for ch in self._mask_curr:
-                        _d = np.hypot(_x-self.qx[ch],_y-self.qy[ch])
-                        if _d<dist_masked:
-                            dist_masked = _d
-                    dist_frac_tol = dist_masked/dist_unmasked
-                    if dist_frac_tol > self.distance_frac_tolerance:
-                        all_clear = False
-            # number threshold
-            if not all_clear:
-                _frac = len(channels_unmasked)/len(channels)
-                if _frac < self.number_frac_tolerance:
-                    all_clear = True
-            # tag, turn, & return
-            if not all_clear:
-                self.labels[coord[0],coord[1]] = 3
-                self._dirs[self._pos] = self._right(self._dirs[self._pos])
-                return True
-        # if no data points are missing, can we remove crystals?
-        # if so, label 3, turn walk & return
-        if self._can_remove_crystal(channels)[0]:
-            self.labels[coord[0],coord[1]] = 3
-            self._dirs[self._pos] = self._right(self._dirs[self._pos])
-            return True
-        else:
-            # if no data is missing and no crystals can be removed,
-            # label, then continue  walking - step forward, turn, walk
-            self.state_crystals[coord[0]][coord[1]] = self._crystals_curr
-            self.state_masks[coord[0]][coord[1]] = self._mask_curr
-            self._scores[coord[0]][coord[1]] = self._best_score_curr
-            self._score_caps[coord[0],coord[1]] = self._score_cap_curr
-            self.labels[coord[0],coord[1]] = 1
-            # update path
-            self._coords.append(coord)
-            self._pos += 1
-            self._dirs.append(self._left(self._dirs[self._pos-1]))
-            return True
-        pass
-
     def _backtrack_and_spawn(self):
         # are we done?
         if self._pos == 0:
-            self._clean_path(self._coords[0])
             return False
         else:
             # no? orient, step backwards, and remove path end point
@@ -813,17 +627,163 @@ class ACCHOO:
             self._dirs[p-1] = self._left(d)
             return True
 
+    def _new_pixel(self,coord):
+        """ assess an unknown pixel from an existing path.
+        if it is described by the current mask, label 1 and walk
+        if it isn't, label 3 or 4 and turn
+        """
+        # get data
+        self._data_curr = x,y,inten = self._get_data(coord)
+        channels = self._get_data_channels(x,y)
+        # get the cost with the current mask
+        cost = self._get_cost(channels,self._crystals_curr,self._mask_curr)
+        self._best_score_curr = cost
+        # can we remove a crystal? if so, label 3, turn & return
+        can_remove, rm_idx = self._can_remove_crystal(channels)
+        if can_remove:
+            self.labels[coord[0],coord[1]] = 3
+            self._rmable_index[coord[0],coord[1]] = rm_idx
+            self._dirs[self._pos] = self._right(self._dirs[self._pos])
+            return True
+        # is the threshold maintained? if not, label, turn & return
+        elif cost < self._cost_thresh:
+            self.labels[coord[0],coord[1]] = 4
+            self._dirs[self._pos] = self._right(self._dirs[self._pos])
+            return True
+        # if the threshold is maintained and no crystals can be removed,
+        # label, then continue  walking - step forward, turn, walk
+        else:
+            self._scores[coord[0]][coord[1]] = self._best_score_curr
+            self.labels[coord[0],coord[1]] = 1
+            # update path
+            self._coords.append(coord)
+            self._pos += 1
+            self._dirs.append(self._left(self._dirs[self._pos-1]))
+            return True
+        pass
+
+    def _finalize_path_and_update_crystals(self,seed):
+        """ store seed and path; update labels; update crystals; reset path variables
+        Updating crystals entails checking if the current crystals are part of existing
+        ones or require a new crystal, then merging or creating them
+        """
+        # store seed
+        self.seeds.append(seed)
+        # store path
+        lab1 = self.labels==1
+        lab2 = self.labels==2
+        lab3 = self.labels==3
+        lab4 = self.labels==4
+        ar = np.zeros(self.shape,dtype=int)
+        ar[lab1]=1
+        ar[lab3]=3
+        ar[lab4]=4
+        self.paths.append(ar)
+        # update crystals
+        # get current crystals & masks
+        xtals_curr = self._crystals_curr
+        masks_curr = [self._get_mask(xtal) for xtal in xtals_curr]
+        # get adjacent labelled pixels
+        footprint = np.ones((3,3),dtype=bool)
+        m1 = binary_opening(lab1,structure=footprint)
+        x_coords,y_coords = np.nonzero(np.logical_and(m1,lab2))
+        # get adjacent crystal masks
+        xtals_adj = []
+        masks_adj = []
+        adj_indices = []
+        for x0,y0 in zip(x_coords,y_coords):
+            xtal_inds = self._state_crystals[x0][y0]
+            xtals = [self.crystals[ind] for ind in xtal_inds]
+            for xtal,ind in zip(xtals,xtal_inds):
+                if not xtal in xtals_adj:
+                    xtals_adj.append(xtal)
+                    masks_adj.append(self._get_mask(xtal))
+                    adj_indices.append(ind)
+        # compare their masks - are any crystal masks identical?
+        matches = []
+        for idx,mask in enumerate(masks_curr):
+            for jdx,_mask in enumerate(masks_adj):
+                if self._mask_equal(mask,_mask):
+                    # label true
+                    matches.append((idx,jdx))
+        # track crystal indices for this path (merged or new)
+        _path_crystal_indices = []
+        # perform merge
+        xtals_merged = []
+        for match in matches:
+            # get xtals
+            xtal_curr_idx,xtal_merge_idx_tmp = match
+            xtal_merge_idx = adj_indices[xtal_merge_idx]
+            # has current merging xtal already been merged?
+            # ...if not, flag it and merge 
+            if xtal_curr_idx not in xtals_merged:
+                xtals_merged.append(xtal_curr_idx)
+                # update images and path indices
+                _path_crystal_indices.append(xtal_merge_idx)
+                im_curr = self._crystal_images[xtal_merge_idx]
+                im_curr = np.logical_or(im_curr,lab1)
+                self._crystal_images[xtal_merge_idx] = im_curr
+            # ...if so, flag for later final crystal merge
+            else:
+                if self._verbose:
+                    print('crystal flagged for final merge, see self._final_crystal_merge')
+                self._final_crystal_merge.append(xtal_merge_idx)
+            pass
+        # otherwise, create new crystals
+        for idx,(xtal,mask) in enumerate(zip(xtals_curr,masks_curr)):
+            if idx not in xtals_merged:
+                self.crystals.append(xtal)
+                self.crystal_masks.append(mask)
+                self.crystal_images.append(lab1)
+                jdx = self.N-1
+                _path_crystal_indices.append(jdx)
+        # populate state vars
+        xs,ys = np.nonzero(lab1)
+        for x0,y0 in zip(xs,ys):
+            self.state_crystals[x0][y0] = _path_crystal_indices
+            self.state_masks[x0][y0] = self._path_mask
+        # update labels
+        self.labels[lab1] = 2  # Note: will need to change 3,4-->5,6 after seeded path loops
+        # reset path vars
+        self._reset_path_vars()
+        pass
+
+    def _pick_seeded_seed(self,seed_picker='max'):
+        pos = np.where(np.logical_or(self.labels==3,self.labels==4))
+        n_seeds = len(pos[0])
+        assert(n_seeds>0), "no current seed pixels (label= 3 or 4) found when a seeded pixel was requested"
+        assert(seed_picker in ['max','most','random','front','back',]), f"Unknown value for seed picker {seed_picker}!"
+        if seed_picker == 'random':
+            n = np.random.randint(0,n_empty)
+        elif seed_picker == 'max':
+            n = np.argmax(self._inten_tot[pos])
+        elif seed_picker == 'most':
+            n = np.argmax(self._n_data_points[pos])
+        elif seed_picker == 'back':
+            n = -1
+        elif seed_picker == 'front':
+            n = 0
+        else:
+            raise Exception(f"Unknown value for seed picker {seed_picker}")
+        seed = pos[0][n],pos[1][n]
+        return seed
+
     def _endloop(self):
         """ cleans up
         """
         # TODO
-        # wrap in an access class?
-        print('holy cow, its the endloop whaaaaaaaaaaaaaaaat')
+        print('Complete.')
+        print(f'Found {self.N} crystals.')
+        print('The boolean image .crystal_images[i] is associated with the basis vectors .crystals[i],')
+        print('which is a length 1 or 2 tuple of ints which point to floating (x,y) pairs which are')
+        print('at (.qx,.qy) in calibrated and (._qx,._qy) in pixel coordinates. ')
+        print('Use .show_data_mask_compare and .show_data_mask_DP_compare to inspect pixel data')
         pass
 
 
-    ####### scoring utilities #######
+    ####### Utilities ########
 
+    ### Cost ###
     def _score_crystal_options_and_update(self,crystals_opts,mask_opts):
         """ compare the scores of all the current options and
         update with the current best option
@@ -835,7 +795,44 @@ class ACCHOO:
                 self._mask_curr = mask_opt
                 self._best_score_curr = cost
 
-    # crystal generation permutations
+    def _score_crystal_options_and_update_addxtals(self,crystals_opts,mask_opts):
+        """ compare the scores of all the current options and
+        update with the current best option, preserving/appending to the end of
+        the self._crystals_curr list
+        """
+        for xtals_opt,mask_opt in zip(crystals_opts,mask_opts):
+            cost = self._get_cost(self._data_channels_curr,xtals_opt,mask_opt)
+            if cost > self._best_score_curr:
+                for xtal in xtals_opt:
+                    if not self._xtal_in_xtals(xtal,self._crystals_curr):
+                        self._crystals_curr.append(xtal)
+                self._mask_curr = mask_opt
+                self._best_score_curr = cost
+
+    def _get_cost(self, channels, xtals, mask):
+        """ The cost is
+                f = -1e6a-1e3b-c
+        where
+            a = # unmasked data points (v1)
+            a = sum of unmasked data intensities (v2)
+            b = # basis vectors
+            c = # on-axis crystals
+        """
+        a = 0
+        for idx,c in enumerate(channels):
+            if c not in mask:
+                a += self._data_curr[2][idx]
+        #a = len(set(channels)-set(mask))
+        b = 0
+        c = 0
+        for xtal in xtals:
+            l = len(xtal)
+            b += l
+            if l>1:
+                c += 1
+        return -1e6*a*self._a_scale-1e3*b-c
+
+    ### Crystal Search ###
     def _get_b_next_opts(self,m):
         """ finds the next basis vector options and adds them to the running list
         of options self._b_opts_curr.  m is boolean with len(data)
@@ -844,7 +841,7 @@ class ACCHOO:
         x,y,inten = self._data_curr
         m_inds = np.nonzero(m)[0]
         n = np.sum(m)
-        N = self._crystals_n_opts
+        #N = self._crystals_n_opts
         # for new set, populate with num_lowq + num_highi vectors
         if len(self._b_opts_curr)==0:
             num_lowq = self._num_lowq if self._num_lowq<n else n-1
@@ -896,6 +893,9 @@ class ACCHOO:
         masks_opts = []
         # ensure we have enough b options
         N = self._crystals_n_opts
+        print(N)
+        print(b_opts)
+        print()
         assert(len(b_opts)>=N), "number of b options should not be less than number of crystals!"
         # get b options combinations
         b_combs = list(combinations(b_opts,N))
@@ -928,8 +928,7 @@ class ACCHOO:
         # return
         return crystals_opts, masks_opts
 
-
-    ####### other utility methods #######
+    ### Misc. Utilities ###
 
     # data
     def _get_data(self,seed):
@@ -951,30 +950,6 @@ class ACCHOO:
         """
         return np.argmin(np.hypot(self.qx-q[0],self.qy-q[1]))
 
-    # cost
-    def _get_cost(self, channels, xtals, mask):
-        """ The cost is
-                f = -1e6a-1e3b-c
-        where
-            a = # unmasked data points (v1)
-            a = sum of unmasked data intensities (v2)
-            b = # basis vectors
-            c = # on-axis crystals
-        """
-        a = 0
-        for idx,c in enumerate(channels):
-            if c not in mask:
-                a += self._data_curr[2][idx]
-        #a = len(set(channels)-set(mask))
-        b = 0
-        c = 0
-        for xtal in xtals:
-            l = len(xtal)
-            b += l
-            if l>1:
-                c += 1
-        return -1e6*a*self._a_scale-1e3*b-c
-
     # empty pixels
     def label_empty_pixels(self):
         self._labelled_empties = True
@@ -985,28 +960,36 @@ class ACCHOO:
                 i = np.sum(self.d.cal[rx,ry].data['intensity'][1:])
                 if l < self.min_empty:
                     self.labels[rx,ry] = 2
-                    self.empty[rx,ry] = 1
+                    self.noncrystalline[rx,ry] = 1
                 elif i < self.thresh_empty:
                     self.labels[rx,ry] = 2
-                    self.empty[rx,ry] = 1
+                    self.noncrystalline[rx,ry] = 1
 
     def clean_empty_pixels(self,reverse=False,iteropen=1,iterclose=1):
         """ Performs a binary opening then closing. `reverse` flipse the order,
             and iter* control iterations
         """
+        # open/close
         if reverse:
             x = binary_closing(binary_opening(
-                self.labels,iterations=iteropen),iterations=iterclose)
+                self.noncrystalline,iterations=iteropen),iterations=iterclose)
         else:
             x = binary_opening(binary_closing(
-                self.labels,iterations=iterclose),iterations=iteropen)
-        self.empty = x
+                self.noncrystalline,iterations=iterclose),iterations=iteropen)
+        # handle edges
+        x[:,0] = x[:,1]
+        x[:,-1] = x[:,-2]
+        x[0,:] = x[1,:]
+        x[-1,:] = x[-2,:]
+        # assign vars
+        self.noncrystalline = x
         self.labels[x] = 2
         self.labels[np.logical_not(x)] = 0
+        pass
 
     # boolean checks
     def _can_remove_crystal(self,channels):
-        """ can we?
+        """ can we? returns bool, idx of the removable xtal
         """
         for idx in range(len(self._crystals_curr)):
             xtals = self._crystals_curr.copy()
@@ -1014,7 +997,8 @@ class ACCHOO:
             masks = [self._get_mask(xtal) for xtal in xtals]
             mask = self._mask_union([self._mask_base_curr]+masks)
             cost = self._get_cost(channels,xtals,mask)
-            if cost > -1e6 * self._score_cap_curr:
+            thresh = max(self._cost_thresh,self._best_score_curr)
+            if cost > thresh:
                 return True, idx
         return False, -1
 
@@ -1032,6 +1016,9 @@ class ACCHOO:
             return False
         else:
             return True
+
+    def _mask_equal(self, mask1, mask2):
+        return set(mask1)==set(mask2)
 
     # masks
     def _get_mask(self,crystal):
@@ -1124,8 +1111,8 @@ class ACCHOO:
         return list(m)
 
     # orienteering
-    # comment: let (0,1,2,3) be down, left, up, right
-    # in UL origin vertical x RHC system
+    # comment on direction: let (0,1,2,3) be down, left, up, right
+    # with the origin upper left vertical x RHC system
     def _left(self,n):
         return (n-1)%4
     def _right(self,n):
@@ -1176,22 +1163,11 @@ class ACCHOO:
             return c,self.labels[c[0],c[1]]
 
     # miscellaneous
-    def _clean_path(self,seed):
-        self.seeds.append(seed)
-        lab1 = self.labels==1
-        lab3 = self.labels==3
-        if self.store_xtalforms:
-            ar = np.zeros(self.shape,dtype=int)
-            ar[lab1]=1
-            ar[lab3]=2
-            self.crystalforms.append(ar)
-        self.labels[lab1] = 2
-        self.labels[lab3] = 4
-        self._reset_path_vars()
-        pass
-
     def _single_pixel_shake(self):
-        #print('\/\** \/ **/\/ ***do the single*pixel shake*** \/\** \/**\/ **/\/')
+        if self._verbose:
+            print("\/\** \/ **/\/ ***do the single*pixel shake*** \/\** \/**\/ **/\/")
+            print(f"\/\** \/ **/\/ ***i'm at {self._coords[self._pos]} just do *** \/\** \/**\/ **/\/")
+            print("\/\** \/ **/\/ ***doin a single*pixel shake*** \/\** \/**\/ **/\/")
         pass
 
     def _transform_cal_to_pix(self,x,y):
@@ -1204,6 +1180,507 @@ class ACCHOO:
         x += origin[0]*self.upsample
         y += origin[1]*self.upsample
         return x,y
+
+    ####### Visualization Methods #######
+
+    def show_labels(self,
+        cmap='inferno',
+        c_amorph='cornflowerblue',
+        vp={'vmin':0,'vmax':4},
+        returnfig=False,
+        ):
+        fig,ax = show(self.labels,mask=~self.noncrystalline,
+            mask_color=c_amorph,cmap=cmap,returnfig=True, **vp)
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+    def show_path(self,
+        idx,
+        cmap='inferno',
+        c_amorph='cornflowerblue',
+        c_seed='springgreen',
+        marker='x',
+        vp={'vmin':0,'vmax':2},
+        returnfig=False,
+        ):
+        coord = self.seeds[idx]
+        ar = self.paths[idx]
+        print(f'Showing path seeded at {coord}')
+        fig,ax = show(ar,mask=~self.noncrystalline,
+            mask_color=c_amorph,cmap=cmap,returnfig=True, **vp)
+        ax.scatter(coord[1],coord[0],color=c_seed,marker=marker)
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+    def show_voronoi(self,c='w',lw=1,vp={},returnfig=False):
+        # Show
+        fig,ax = show_points(
+            self.bvm,
+            x=self._qx,
+            y=self._qy,
+            open_circles=True,
+            returnfig=True,
+            **vp
+        )
+        for region in range(len(self._voronoi_vertices)):
+            vertices_curr = self._voronoi_vertices[region]
+            if vertices_curr is not None:
+                for i in range(len(vertices_curr)):
+                    x0,y0 = vertices_curr[i,:]
+                    x1,y1 = vertices_curr[(i+1)%len(vertices_curr),:]
+                    ax.plot((y0,y1),(x0,x1),c,lw=lw)
+        ax.set_xlim([0,self.bvm.data.shape[1]])
+        ax.set_ylim([0,self.bvm.data.shape[0]])
+        plt.gca().invert_yaxis()
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+    def show_voronoi_mask(self,mask,mask_alpha=0.4,mask_color='y',
+        c='lightcyan',lw=0.5,vp={},returnfig=False):
+        """ mask is a list of integer (voronoi regions)
+        """
+        patches = []
+        fig,ax = self.show_voronoi(c=c,lw=lw,vp=vp,returnfig=True)
+        for idx in mask:
+            vertices_curr = self._voronoi_vertices[idx]
+            if vertices_curr is not None:
+                vert = np.roll(vertices_curr,-1,1)
+                patches.append(Polygon(vert))
+        p = PatchCollection(patches,alpha=mask_alpha,color=mask_color)
+        ax.add_collection(p)
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+    def show_data_mask_compare(self,coord,mask_alpha=0.4,mask_color='y',
+        c='lightcyan',lw=0.5,marker='x',markercolor='blue',markersize=100,
+        vectors=False,vect_cmap='cool',vect_width=0.5,vect_headsize=6,vectp={},
+        vp={},returnfig=False):
+        """ show the data points, mask, voronoi, bvm overlaid
+        """
+        rx,ry = coord
+        mask = self.state_masks[rx][ry]
+
+
+        fig,ax = self.show_voronoi_mask(
+            mask = mask,
+            c = c,
+            lw = lw,
+            vp = vp,
+            mask_alpha=0.4,
+            returnfig=True
+        )
+        qpixsize = self.d.calibration.get_Q_pixel_size()
+        origin = self.d.calibration.get_origin_mean()
+        d = self.d.cal[rx,ry].data
+        x,y = d['qx'],d['qy']
+        x,y = self._transform_cal_to_pix(x,y)
+        ax.scatter(y,x,color=markercolor,s=markersize,marker=marker)
+        # if vectors were requested, add them
+        if vectors:
+            # set up vectors
+            crystal_inds = self.state_crystals[coord[0]][coord[1]]
+            crystals = [self.crystals[idx] for idx in crystal_inds]
+            crystals_vectors = []
+            for xtal in crystals:
+                if len(xtal)==1:
+                    i = xtal[0]
+                    x,y = self.qx[i],self.qy[i]
+                    x,y = self._transform_cal_to_pix(x,y)
+                    crystals_vectors.append(((x,y),))
+                elif len(xtal)==2:
+                    i,j = xtal[0],xtal[1]
+                    x1,y1 = self.qx[i],self.qy[i]
+                    x1,y1 = self._transform_cal_to_pix(x1,y1)
+                    x2,y2 = self.qx[j],self.qy[j]
+                    x2,y2 = self._transform_cal_to_pix(x2,y2)
+                    crystals_vectors.append(((x1,y1),(x2,y2)))
+            # set up colors
+            l = len(crystals_vectors)
+            cm = plt.get_cmap(vect_cmap)
+            colors = [cm(n/l) for n in range(l)]
+            # plot vectors
+            origin = self.d.calibration.get_origin_mean()
+            origin=tuple([x*self.upsample for x in origin])
+            for xtalvs,color in zip(crystals_vectors,colors):
+                for v in xtalvs:
+                    add_vector(ax,d=dict({
+                        'x0':origin[0],
+                        'y0':origin[1],
+                        'vx':v[0]-origin[0],
+                        'vy':v[1]-origin[1],
+                        'color':color,
+                        'width':vect_width,
+                        'head_width':vect_headsize,
+                    }, **vectp))
+            print(f"crystal channels: {crystals}")
+        # return
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+    def show_data_mask_DP_compare(
+        self,
+        coord,
+        figsize=(10,5),
+        vp={},
+        c_scat='r',
+        s_scat=25,
+        sp={},
+        c_vor='lightcyan',
+        lw=0.5,
+        mask_color='y',
+        mask_alpha=0.4,
+        marker='x',
+        markercolor='blue',
+        markersize=100,
+        vectors=False,
+        vect_cmap='cool',
+        vect_width=0.5,
+        vect_headsize=6,
+        vectp={},
+        dpp={'scaling':'log'},
+        dp_rotate=0,
+        dp_invert=False,
+        returnfig=False):
+        """ Full comparison including the diffraction data side-by-side
+
+        Parameters
+        ----------
+        coord : tuple of ints
+            the scan coordinate
+        figsize : tuple
+        vp : dict
+            visualization parameters to pass to ax.show(bvm, **vp)
+        c_scat : color
+            color of voronoi maxima circles
+        s_scat : number
+            size of the voronoi maxima circles
+        sp : dict
+            vis params to pass to ax.scatter(..., **sp) for voronoi maxima circles
+        c_vor : color
+            color for voronoi edges
+        lw : number
+            linewidth for voronoi edges
+        mask_color : color
+            color for the voronoi mask
+        mask_alpha : number
+            transparency for the voronoi mask
+        marker : str
+            marker type for the data points
+        markercolor : color
+            color for the data points
+        markersize : number
+            size for the data points
+        vectors : bool
+            toggles showing crystal vectors that generated the mask
+        vect_cmap : colormap
+            the cmap used to draw vectors & differentiate if there are
+            multiple crystals
+        vect_width : number
+            vector width
+        vect_headsize : number
+            vector headsize
+        vectp : dict
+            param dictionary to pass to add_vector(**vp)
+        dpp : dict
+            param dictionary to pass to show(diffraction_pattern, **dpp)
+        dp_rotate : int
+            rotates the diffraction pattern by 0=none,1=pi/2,2=pi,3=3pi/2
+        dp_invert : bool
+            inverst the diffraction pattern
+        returnfig : bool
+            toggles returning the figure
+        """
+        # ensure datacube is there
+        assert(self._datacube is not None)
+        # make the figure
+        fig,(ax,ax2) = plt.subplots(1,2,figsize=figsize)
+        # show the BVM
+        show(self.bvm, figax=(fig,ax), **vp)
+        # add voronoi maxima
+        ax.scatter(self._qy, self._qx, s=s_scat, edgecolor=c_scat, facecolor="none", **sp)
+        # add voronoi edges
+        for region in range(len(self._voronoi_vertices)):
+            vertices_curr = self._voronoi_vertices[region]
+            if vertices_curr is not None:
+                for i in range(len(vertices_curr)):
+                    x0,y0 = vertices_curr[i,:]
+                    x1,y1 = vertices_curr[(i+1)%len(vertices_curr),:]
+                    ax.plot((y0,y1),(x0,x1),c_vor,lw=lw)
+        ax.set_xlim([0,self.bvm.data.shape[1]])
+        ax.set_ylim([0,self.bvm.data.shape[0]])
+        ax.invert_yaxis()
+        # get data and mask
+        rx,ry = coord
+        mask = self.state_masks[rx][ry]
+        # show voronoi mask
+        patches = []
+        for idx in mask:
+            vertices_curr = self._voronoi_vertices[idx]
+            if vertices_curr is not None:
+                vert = np.roll(vertices_curr,-1,1)
+                patches.append(Polygon(vert))
+        p = PatchCollection(patches,alpha=mask_alpha,color=mask_color)
+        ax.add_collection(p)
+        # transform data
+        qpixsize = self.d.calibration.get_Q_pixel_size()
+        origin = self.d.calibration.get_origin_mean()
+        d = self.d.cal[rx,ry].data
+        x,y = d['qx'],d['qy']
+        x,y = self._transform_cal_to_pix(x,y)
+        ax.scatter(y,x,color=markercolor,s=markersize,marker=marker)
+        # if vectors were requested, add them
+        if vectors:
+            # set up vectors
+            crystal_inds = self.state_crystals[coord[0]][coord[1]]
+            crystals = [self.crystals[idx] for idx in crystal_inds]
+            crystals_vectors = []
+            for xtal in crystals:
+                if len(xtal)==1:
+                    i = xtal[0]
+                    x,y = self.qx[i],self.qy[i]
+                    x,y = self._transform_cal_to_pix(x,y)
+                    crystals_vectors.append(((x,y),))
+                elif len(xtal)==2:
+                    i,j = xtal[0],xtal[1]
+                    x1,y1 = self.qx[i],self.qy[i]
+                    x1,y1 = self._transform_cal_to_pix(x1,y1)
+                    x2,y2 = self.qx[j],self.qy[j]
+                    x2,y2 = self._transform_cal_to_pix(x2,y2)
+                    crystals_vectors.append(((x1,y1),(x2,y2)))
+            # set up colors
+            l = len(crystals_vectors)
+            cm = plt.get_cmap(vect_cmap)
+            colors = [cm(n/l) for n in range(l)]
+            # plot vectors
+            origin = self.d.calibration.get_origin_mean()
+            origin=tuple([x*self.upsample for x in origin])
+            for xtalvs,color in zip(crystals_vectors,colors):
+                for v in xtalvs:
+                    add_vector(ax,d=dict({
+                        'x0':origin[0],
+                        'y0':origin[1],
+                        'vx':v[0]-origin[0],
+                        'vy':v[1]-origin[1],
+                        'color':color,
+                        'width':vect_width,
+                        'head_width':vect_headsize,
+                    }, **vectp))
+        # show diffraction pattern
+        dp = self._datacube[rx,ry]
+        if dp_invert:
+            ax2.invert_yaxis()
+        if dp_rotate!=0:
+            dp = np.rot90(dp, k=dp_rotate)
+        show(dp, figax=(fig,ax2), **dpp)
+        # return
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+
+
+
+
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+
+
+################
+
+    def show_data_mask_compare(self,coord,mask_alpha=0.4,mask_color='y',
+        c='lightcyan',lw=0.5,marker='x',markercolor='blue',markersize=100,
+        vectors=False,vect_cmap='cool',vect_width=0.5,vect_headsize=6,vectp={},
+        vp={},returnfig=False):
+        """ show the data points, mask, voronoi, bvm overlaid
+        """
+        rx,ry = coord
+        mask = self.state_masks[rx][ry]
+        fig,ax = self.show_voronoi_mask(
+            mask = mask,
+            c = c,
+            lw = lw,
+            vp = vp,
+            mask_alpha=0.4,
+            returnfig=True
+        )
+        qpixsize = self.d.calibration.get_Q_pixel_size()
+        origin = self.d.calibration.get_origin_mean()
+        d = self.d.cal[rx,ry].data
+        x,y = d['qx'],d['qy']
+        x,y = self._transform_cal_to_pix(x,y)
+        ax.scatter(y,x,color=markercolor,s=markersize,marker=marker)
+        # if vectors were requested, add them
+        if vectors:
+            # set up vectors
+            crystal_inds = self.state_crystals[coord[0]][coord[1]]
+            crystals = [self.crystals[idx] for idx in crystal_inds]
+            crystals_vectors = []
+            for xtal in crystals:
+                if len(xtal)==1:
+                    i = xtal[0]
+                    x,y = self.qx[i],self.qy[i]
+                    x,y = self._transform_cal_to_pix(x,y)
+                    crystals_vectors.append(((x,y),))
+                elif len(xtal)==2:
+                    i,j = xtal[0],xtal[1]
+                    x1,y1 = self.qx[i],self.qy[i]
+                    x1,y1 = self._transform_cal_to_pix(x1,y1)
+                    x2,y2 = self.qx[j],self.qy[j]
+                    x2,y2 = self._transform_cal_to_pix(x2,y2)
+                    crystals_vectors.append(((x1,y1),(x2,y2)))
+            # set up colors
+            l = len(crystals_vectors)
+            cm = plt.get_cmap(vect_cmap)
+            colors = [cm(n/l) for n in range(l)]
+            # plot vectors
+            origin = self.d.calibration.get_origin_mean()
+            origin=tuple([x*self.upsample for x in origin])
+            for xtalvs,color in zip(crystals_vectors,colors):
+                for v in xtalvs:
+                    add_vector(ax,d=dict({
+                        'x0':origin[0],
+                        'y0':origin[1],
+                        'vx':v[0]-origin[0],
+                        'vy':v[1]-origin[1],
+                        'color':color,
+                        'width':vect_width,
+                        'head_width':vect_headsize,
+                    }, **vectp))
+            print(f"crystal channels: {crystals}")
+        # return
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+        #########3
+        qpixsize = self.d.calibration.get_Q_pixel_size()
+        origin = self.d.calibration.get_origin_mean()
+        d = self.d.cal[rx,ry].data
+        x,y = d['qx'],d['qy']
+        x,y = self._transform_cal_to_pix(x,y)
+        ax.scatter(y,x,color=markercolor,s=markersize,marker=marker)
+        # if vectors were requested, add them
+        if vectors:
+            # set up vectors
+            crystal_inds = self.state_crystals[coord[0]][coord[1]]
+            crystals = [self.crystals[idx] for idx in crystal_inds]
+            crystals_vectors = []
+            for xtal in crystals:
+                if len(xtal)==1:
+                    i = xtal[0]
+                    x,y = self.qx[i],self.qy[i]
+                    x,y = self._transform_cal_to_pix(x,y)
+                    crystals_vectors.append(((x,y),))
+                elif len(xtal)==2:
+                    i,j = xtal[0],xtal[1]
+                    x1,y1 = self.qx[i],self.qy[i]
+                    x1,y1 = self._transform_cal_to_pix(x1,y1)
+                    x2,y2 = self.qx[j],self.qy[j]
+                    x2,y2 = self._transform_cal_to_pix(x2,y2)
+                    crystals_vectors.append(((x1,y1),(x2,y2)))
+            # set up colors
+            l = len(crystals_vectors)
+            cm = plt.get_cmap(vect_cmap)
+            colors = [cm(n/l) for n in range(l)]
+            # plot vectors
+            origin = self.d.calibration.get_origin_mean()
+            origin=tuple([x*self.upsample for x in origin])
+            for xtalvs,color in zip(crystals_vectors,colors):
+                for v in xtalvs:
+                    add_vector(ax,d=dict({
+                        'x0':origin[0],
+                        'y0':origin[1],
+                        'vx':v[0]-origin[0],
+                        'vy':v[1]-origin[1],
+                        'color':color,
+                        'width':vect_width,
+                        'head_width':vect_headsize,
+                    }, **vectp))
+            print(f"crystal channels: {crystals}")
+        # return
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+    ### Convenience Properties ###
+    @property
+    def C(self):
+        return len(self._voronoi.points)
+    @property
+    def N(self):
+        return len(self.crystals)
+    @property
+    def qpixsize(self):
+        return self.d.calibration.get_Q_pixel_size()/self.upsample
+    @property
+    def shape(self):
+        return self.d.shape
+
+    ### Setter Methods ###
+    def set_min_points_empty(self,min_points_empty):
+        self.min_empty = min_points_empty
+    def set_min_points(self,min_points):
+        self.min = min_points
+    def set_min_inten_empty(self,min_inten_empty):
+        self.thresh_empty = min_inten_empty
+    def set_min_inten(self,min_inten):
+        self.thresh = min_inten
+    def set_dist_frac_tol(self,dist_frac_tol):
+        self.distance_frac_tolerance = dist_frac_tol
+    def set_numb_frac_tol(self,numb_frac_tol):
+        self.number_frac_tolerance = numb_frac_tol
+    def set_seed_picker(self,seed_picker):
+        assert(seed_picker in ['max','most','random','front','back',]), f"Unknown value for seed picker {seed_picker}!"
+        self.seed_picker = seed_picker
+        # for "maximum" picker, perform calc upfront
+        if seed_picker=='max':
+            self._inten_tot = np.zeros(self.shape)
+            for rx in range(self.shape[0]):
+                for ry in range(self.shape[1]):
+                    if len (self.d.cal[rx,ry].data)>1:
+                        self._inten_tot[rx,ry] = np.sum(self.d.cal[rx,ry].data['intensity'][1:])
+        elif seed_picker=='most':
+            self._n_data_points = np.zeros(self.shape)
+            for rx in range(self.shape[0]):
+                for ry in range(self.shape[1]):
+                    self._n_data_points[rx,ry] = len(self.d.cal[rx,ry].data['intensity'])
+    def set_num_lowq(self,num_lowq):
+        self._num_lowq = num_lowq
+    def set_num_highi(self,num_highi):
+        self._num_highi = num_highi
+    def set_a_scale(self,a_scale):
+        self._a_scale = a_scale
+    def set_cost_thresh(self,cost_thresh):
+        self._cost_thresh = cost_thresh
+
 
 
 
@@ -1282,5 +1759,252 @@ class ACCHOO:
 #                             mask_opts.append(m)
 #         # return
 #         return crystals_opts,mask_opts
+
+
+
+        #if self.thresh > 0:
+        #    self._mask_base_curr = self._mask_union([self._mask_base_curr,self._get_inten_mask(inten)])
+
+
+#    def _new_pixel(self,coord):
+#        """
+#        """
+#        # get data
+#        self._data_curr = x,y,inten = self._get_data(coord)
+#        channels = self._get_data_channels(x,y)
+#        # get the cost with the current mask
+#        cost = self._get_cost(channels,self._crystals_curr,self._mask_curr)
+#        self._best_score_curr = cost
+#        # can we remove a crystal? if so, label 3, turn walk & return
+#        can_remove, rm_idx = self._can_remove_crystal(channels)
+#        if can_remove:
+#            self.labels[coord[0],coord[1]] = 3
+#            self._rmable_index[coord[0],coord[1]] = rm_idx
+#            self._dirs[self._pos] = self._right(self._dirs[self._pos])
+#            return True
+#        # TODO - TEST
+#        # let's try without the tolerances; since we've moved
+#        # to an intensity-based cost function this may not be needed/appropriate
+#        # for scores below -1e6, i.e. missing data points,
+#        # are we within tolerances? if so, label & return
+#        elif cost < self._cost_thresh:
+##            all_clear = True
+##            channels_unmasked = list(set(channels)-set(self._mask_curr))
+##            channels_unmasked_bool = np.array([c in channels_unmasked for c in channels])
+##            for idx in np.nonzero(channels_unmasked_bool)[0]:
+##                # intensity thresh
+##                if inten[idx] < self.thresh:
+##                    pass
+##                # distance tolerance
+##                else:
+##                    _x,_y = x[idx],y[idx]
+##                    _c = channels[idx]
+##                    dist_unmasked = np.hypot(_x-self.qx[_c],_y-self.qy[_c])
+##                    dist_masked = 1e8
+##                    for ch in self._mask_curr:
+##                        _d = np.hypot(_x-self.qx[ch],_y-self.qy[ch])
+##                        if _d<dist_masked:
+##                            dist_masked = _d
+##                    dist_frac_tol = dist_masked/dist_unmasked
+##                    if dist_frac_tol > self.distance_frac_tolerance:
+##                        all_clear = False
+##            # number threshold
+##            if not all_clear:
+##                _frac = len(channels_unmasked)/len(channels)
+##                if _frac < self.number_frac_tolerance:
+##                    all_clear = True
+#            # tag, turn, & return
+#            all_clear = False
+#            if not all_clear:
+#                self.labels[coord[0],coord[1]] = 4
+#                self._dirs[self._pos] = self._right(self._dirs[self._pos])
+#                return True
+#        else:
+#            # if no data is missing and no crystals can be removed,
+#            # label, then continue  walking - step forward, turn, walk
+#            self.state_crystals[coord[0]][coord[1]] = self._crystals_curr
+#            self.state_masks[coord[0]][coord[1]] = self._mask_curr
+#            self._scores[coord[0]][coord[1]] = self._best_score_curr
+#            #self._score_caps[coord[0],coord[1]] = self._score_cap_curr
+#            self.labels[coord[0],coord[1]] = 1
+#            # update path
+#            self._coords.append(coord)
+#            self._pos += 1
+#            self._dirs.append(self._left(self._dirs[self._pos-1]))
+#            return True
+#        pass
+
+
+
+# from _seeded_path removed to split xtal search methods
+
+#        # gather xtals and masks from neighbors
+#        xtals = []
+#        masks = []
+#        coords = [
+#            (seed[0]-1,seed[1]),
+#            (seed[0],seed[1]-1),
+#            (seed[0]+1,seed[1]),
+#            (seed[0],seed[1]+1)]
+#        s = self.shape
+#        for idx in range(3,-1,-1):
+#            c = coords[idx]
+#            if c[0]<0 or c[0]>=s[0] or c[1]<0 or c[1]>=s[1]:
+#                coords.pop(idx)
+#        for c in coords:
+#            if self.labels[c[0],c[1]] == 2:
+#                xtals.append(self.state_crystals[c[0]][c[1]])
+#                masks.append(self.state_masks[c[0]][c[1]])
+#        # confirm we found some xtals
+#        assert(len(xtals)>0), "this shouldn't be able to happen..."
+#        assert(len(xtals)>0), "you can initiate a _new_path_loop instead, but do check labels."
+#        # prepare mask
+#        m = np.ones(len(x),dtype=bool)
+#        for idx in range(len(x)):
+#            if self._data_channels_curr[idx] in self._mask_curr:
+#                m[idx] = 0
+#        # check for data, and if there's none label & exit
+#        if len(x[m]) < self.min:
+#            self.labels[seed[0],seed[1]] = 2
+#            self.empty[seed[0],seed[1]] = 2
+#            return False
+#        # setup crystals & masks from adjacent pixels
+#        xtals_compare = []
+#        masks_compare = []
+#        for _xtals,_masks in zip(xtals,masks):
+#            for xtal,mask in zip(_xtals,_masks):
+#                if not self._xtal_in_xtals(xtal,xtals_compare):
+#                    xtals_compare.append(xtal)
+#                    masks_compare.append(mask)
+#        # compare and update
+#        self._score_crystal_options_and_update(xtals_compare,masks_compare)
+#        # for scores above -1e6,
+#        # check for excess crystals,
+#        # then return
+#        if self._best_score_curr > self._cost_thresh:
+#            # remove loop
+#            can_remove, idx_rm = self._can_remove_crystal(self._data_channels_curr)
+#            while can_remove:
+#                self._crystals_curr.pop(idx,rm)
+#                can_remove, idx_rm = self._can_remove_crystal(self._data_channels_curr)
+#            # finish
+#            for xtal in self._crystals_curr:
+#                if not self._xtal_in_xtals(xtal, self.crystals):
+#                    self.crystals.append(xtal)
+#            self.state_crystals[seed[0]][seed[1]] = self._crystals_curr
+#            self.state_masks[seed[0]][seed[1]] = self._mask_curr
+#            self._scores[seed[0],seed[1]] = self._best_score_curr
+#            self.labels[seed[0],seed[1]] = 1
+#            # done
+#            self._put_on_shoes_and_coat(seed)
+#            return False
+#        # for scores below -1e6, i.e. missing data points,
+#        # is the score within tolerances?
+#        # if so try a rm, then return
+#        if self._best_score_curr < self._cost_thresh:
+#            all_clear = True
+#            channels_unmasked = list(set(self._data_channels_curr)-set(self._mask_curr))
+#            channels_unmasked_bool = np.array([c in channels_unmasked for c in self._data_channels_curr])
+#            for idx in np.nonzero(channels_unmasked_bool)[0]:
+#                # intensity thresh
+#                if inten[idx] < self.thresh:
+#                    pass
+#                # distance tolerance
+#                else:
+#                    _x,_y = x[idx],y[idx]
+#                    _c = channels[idx]
+#                    dist_unmasked = np.hypot(_x-self.qx[_c],_y-self.qy[_c])
+#                    dist_masked = 1e8
+#                    for ch in self._mask_curr:
+#                        _d = np.hypot(_x-self.qx[ch],_y-self.qy[ch])
+#                        if _d<dist_masked:
+#                            dist_masked = _d
+#                    dist_frac_tol = dist_masked/dist_unmasked
+#                    if dist_frac_tol > self.distance_frac_tolerance:
+#                        all_clear = False
+#            # number threshold
+#            if not all_clear:
+#                _frac = len(channels_unmasked)/len(channels)
+#                if _frac < self.number_frac_tolerance:
+#                    all_clear = True
+#            if all_clear:
+#                # remove loop
+#                can_remove, idx_rm = self._can_remove_crystal(self._data_channels_curr)
+#                while can_remove:
+#                    self._crystals_curr.pop(idx,rm)
+#                    can_remove, idx_rm = self._can_remove_crystal(self._data_channels_curr)
+#                # assign labels
+#                for xtal in self._crystals_curr:
+#                    if not self._xtal_in_xtals(xtal, self.crystals):
+#                        self.crystals.append(xtal)
+#                self.state_crystals[seed[0]][seed[1]] = self._crystals_curr
+#                self.state_masks[seed[0]][seed[1]] = self._mask_curr
+#                self._scores[seed[0],seed[1]] = self._best_score_curr
+#                self.labels[seed[0],seed[1]] = 1
+#                # go walking
+#                self._put_on_shoes_and_coat(seed)
+#                # return
+#                return False
+#        # for scores below -1e6 beyond tolerances,
+#        # gen a new solution, then return
+#        # reset solution vars
+#        self._crystals_curr = []
+#        self._best_score_curr = -1e8
+#        self._crystal_gen_iters = 0
+#        #self._score_cap_curr = 1
+#        self._mask_curr = self._mask_base_curr
+#        loop = True
+#        while loop:
+#            loop = self._seeded_path_internal_loop(seed,x,y,inten,xtals,masks)
+#        return
+
+
+
+
+
+#    def _seeded_path_internal_loop(self,seed,x,y,inten,xtals,masks):
+#        """ gen new solution if other options fail, then walk
+#        """
+#        # get basis vector options & new crystal options
+#        b_next_opts = self._get_b_next_opts(self._mask_curr) # TODO - mask wrong, needs boolean
+#        crystals_opts,mask_opts = self._get_crystal_opts_add(b_next_opts)
+#        # compute scores and update
+#        self._score_crystal_options_and_update(crystals_opts,mask_opts)
+#        # are we done?
+#        if self._best_score_curr > self._cost_thresh: #* self._score_cap_curr:
+#            # finish
+#            for xtal in self._crystals_curr:
+#                if not self._xtal_in_xtals(xtal, self.crystals):
+#                    self.crystals.append(xtal)
+#            self.state_crystals[seed[0]][seed[1]] = self._crystals_curr
+#            self.state_masks[seed[0]][seed[1]] = self._mask_curr
+#            self._scores[seed[0],seed[1]] = self._best_score_curr
+#            self.labels[seed[0],seed[1]] = 1
+#            # done
+#            self._put_on_shoes_and_coat(seed)
+#            return False
+#        else:
+#            # iterate
+#            self._crystal_gen_iters += 1
+#            if self._crystal_gen_iters%10 != 0:
+#                return True
+#            elif self._crystal_gen_iters != 100:
+#                # increase the score cap
+#                # # TODO TODO
+#                self._score_cap_curr += 1
+#                print(f'increased cap to {self._score_cap_curr}')
+#                self._score_caps[seed[0],seed[1]] += 1
+#                #  reset the vectors and xtal options
+#                self._crystals_curr = []
+#                self._mask_curr = self._mask_base_curr
+#                self._best_score_curr = -1e8
+#                return True
+#            else:
+#                print('she cant take much more o this, capn')
+#                self._anomoly = True
+#                self._anom_point = seed
+#                raise Exception(f'an unexpected error has occured; the crystal gen algo needs attention')
+#                sys.exit()
+#                return False
 
 
