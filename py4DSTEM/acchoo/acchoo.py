@@ -14,7 +14,6 @@ from py4DSTEM.visualize import show, show_points, add_vector
 # - final xtal merge
 # - finish DP compare vis method
 
-
 class ACCHOO:
     """
     ACCHOO is an Apt Crystal Classification Heuristic Old-fashioned Optimizer.
