@@ -6,17 +6,22 @@ from itertools import combinations, permutations
 from matplotlib.patches import Polygon
 from matplotlib.collections import PatchCollection
 from scipy.spatial import Voronoi
-from scipy.ndimage import binary_opening, binary_closing
+from scipy.ndimage import binary_opening, binary_closing, binary_dilation
 from py4DSTEM.utils import get_maxima_2D, get_voronoi_vertices
 from py4DSTEM.visualize import show, show_points, add_vector
+
+# TODO:
+# - final xtal merge
+# - finish DP compare vis method
+
 
 class ACCHOO:
     """
     ACCHOO is an Apt Crystal Classification Heuristic Old-fashioned Optimizer.
     It finds crystals from a calibrated BraggVectors instance.
 
-    ACCHOO is a manner of clustering algorithm. Here, clustering
-    means grouping the pixels into sets that belong together according to some
+    ACCHOO is a manner of clustering algorithm. Here, clustering means
+    grouping the pixels into sets that belong together according to some
     similarity measure.  Whereas typically each pixel would be clustered into
     a single group, here, ACCHOO seeks to identify sets of pixels which all
     contain a particular crystal.  Because STEM is a transmission imaging
@@ -28,16 +33,17 @@ class ACCHOO:
     ACCHOO is a heuristic. After labelling non-crystalline pixels it selects
     a seed point, guesses the crystals present by combination of simple basis
     vector sets, then explores adjacent pixels with a walker algorithm which
-    defines the connected set of pixels in which the data is well described by
-    this crystal basis set and its boundary.  A boundary pixel is selected as
-    a new seed, a new crystal basis is determined by growing or removing crystals
+    defines the connected set of pixels and its boundary in which the data is
+    well described by this crystal basis set.  A boundary pixel is selected as
+    a new seed, a new crystal basis is determined including or removing crystals
     from the prior basis or by adding new crystals as appropriate to the data,
-    and the walker algorithm explores, iterating until every pixel is accounted
-    for. It is old-fashioned in that it contains no training or models, as is
-    the nature of heuristics - it seeds, walks, spawns, evaluates, and labels.
-    It finds crystal basis sets quickly by simplifying the data basis such that
-    cost evaluations are fast, memory use is light, and bases are quickly
-    searchable by exhaustion through small combinations.
+    and the walker algorithm again explores, iterating until every pixel is
+    accounted for. It is old-fashioned in that it contains no training or models
+    or weights - just simple heuristic instructions: it seeds, evaluates, walks,
+    spawns, and labels. It finds crystal basis sets quickly by employing a simple
+    data basis such that cost evaluations are fast, memory use is light, and
+    crystal bases are quickly searchable by exhaustion through small
+    combinations.
 
     Basic usage:
 
@@ -48,19 +54,23 @@ class ACCHOO:
     >>> a.label_empty_pixels(...)   # label empty pixels
     >>> a.clean_empty_pixels(...)
     >>> a.run()                     # run. find and label all crystals
-    >>> a.labels                    # show completion labels
+    >>> a.show_labels()             # show completion labels
     >>> seed = a.seeds[i]           # the i'th path's seed coordinate
     >>> a.show_path(i)              # show the i'th path
     >>> a.show_data_mask_compare(c) # show the basis and datapoints at coord c
+    >>> a.show_data_mask_DP_compare(c) # as above, plus the diffraction data
 
     The label meanings are:
     0 = unknown
     1 = current path
     2 = complete
-    3 = current seed - can remove
-    4 = current seed - can add
-    5 = upcoming seed - can remove
-    6 = upcoming seed - can add
+    3 = seed
+
+    IMPORTANT NOTE: ACCHOO assumes the center beam is included in the
+    BraggVectors and that it is in the first (0'th) position at each pixel.
+    If this is not the case, expect errors. If this causes problems, you can
+    either modify the data by adding or swapping index ordering such that
+    this conditions holds, or, modify the source code.
     """
     ####### Set Up #######
 
@@ -68,18 +78,19 @@ class ACCHOO:
         self,
         disks,
         upsample=1,
-        min_points_empty=3,
+        min_points_empty=2,
         min_points=2,
         min_inten_empty=0,
         min_inten=0,
-        dist_frac_tol=1,
-        numb_frac_tol=0,
+        #dist_frac_tol=1,
+        #numb_frac_tol=0,
         seed_picker='max',
         num_lowq=3,
         num_highi=1,
         a_scale=1,
         cost_thresh=-1e6,
         verbose=True,
+        veryverbose=False,
         datacube=None
         ):
         """
@@ -96,16 +107,16 @@ class ACCHOO:
             threshold intensity for data points to be counted as 'empty' or not
         min_inten : bool
             data inclusion intensity threshold
-        dist_frac_tol : number
-            data points which are just over a voronoi ridge from a masked to an
-            unmasked channel may be ignored if the distance fraction
-            (dist_to_masked_vor_point / dis_to_unmasked_vor_point) is under this
-            threshold tolerance. 1 (default) is no tolerance; 1.05 means if the
-            distance to the closest masked seed is within 5% of the closest
-            unmasked seed distance, the point is disregarded
-        numb_frac_tol : number
-            unmasked data points will be ignored unless their fraction of the total
-            number of points is greater than numb_frac_tol
+        #dist_frac_tol : number
+        #    data points which are just over a voronoi ridge from a masked to an
+        #    unmasked channel may be ignored if the distance fraction
+        #    (dist_to_masked_vor_point / dis_to_unmasked_vor_point) is under this
+        #    threshold tolerance. 1 (default) is no tolerance; 1.05 means if the
+        #    distance to the closest masked seed is within 5% of the closest
+        #    unmasked seed distance, the point is disregarded
+        #numb_frac_tol : number
+        #    unmasked data points will be ignored unless their fraction of the total
+        #    number of points is greater than numb_frac_tol
         seed_picker : str in 'max' or 'most' or 'random' or 'front' or 'back'
             strategy for choosing crystal seed points
         num_lowq : int
@@ -124,18 +135,21 @@ class ACCHOO:
             enables side-by-side diffraction pattern / results visualizations
         """
         self._verbose = verbose
+        self._vv = veryverbose
+        self._datacube = datacube
         if self._verbose:
             print("Setting up...")
+            if self._datacube is not None:
+                print("DataCube present.")
         self._setup_disks(disks,upsample)
         self._reset_path_vars()
         self._setup()
-        self._datacube = datacube
         self.set_min_points_empty(min_points_empty)
         self.set_min_points(min_points)
         self.set_min_inten_empty(min_inten_empty)
         self.set_min_inten(min_inten)
-        self.set_dist_frac_tol(dist_frac_tol)
-        self.set_numb_frac_tol(numb_frac_tol)
+        #self.set_dist_frac_tol(dist_frac_tol)
+        #self.set_numb_frac_tol(numb_frac_tol)
         self.set_seed_picker(seed_picker)
         self.set_num_lowq(num_lowq)
         self.set_num_highi(num_highi)
@@ -155,6 +169,15 @@ class ACCHOO:
         self._path_mask = []
         self._path_crystal_indices = []
 
+    def _reset_crystal_search_vars(self):
+        self._b_opts_curr = []
+        self._crystals_curr = []
+        self._crystals_inds_curr = []
+        self._crystals_n_opts = 0
+        self._best_score_curr = -1e8
+        self._mask_base_curr = [0]  # mask center beam
+        self._mask_curr = self._mask_base_curr
+
     def _setup(self):
         s = self.shape
         self.labels = np.zeros(s,dtype=int)
@@ -170,8 +193,8 @@ class ACCHOO:
         self._scores=np.ones(s,dtype=float)
         self._score_caps=np.ones(s,dtype=int)
         self._labelled_empties = False
-        self._rmable_index = -1*np.ones(s,dtype=int)
-        self._final_crystal_merge = []
+        self._path_idx = 0
+        self._merge_xtals = []
 
     # Set data channels
     def get_kpoints(self, p, vp={}, show=True):
@@ -183,7 +206,6 @@ class ACCHOO:
         self._qx = ans['x']
         self._qy = ans['y']
         self._int = ans['intensity']
-
         # transform coordinates
         origin = self.d.calibration.get_origin_mean()
         self.origin = np.array([origin[0]*self.upsample, origin[1]*self.upsample])
@@ -191,7 +213,6 @@ class ACCHOO:
         self.qy = self._qy - self.origin[1]
         self.qx *= self.qpixsize
         self.qy *= self.qpixsize
-
         # store convenience objects
         self._points = np.vstack((self.qx,self.qy)).T
         s = self.d.Qshape
@@ -199,13 +220,11 @@ class ACCHOO:
         self.Lmax = np.hypot(self.FOV[0],self.FOV[1])/2
         fov = (self.FOV[0]*1.05, self.FOV[1]*1.05)
         self._FOV_centered = (-fov[0]/2, fov[0]/2, -fov[1]/2, fov[1]/2)
-
         # get voronoi tesselation
         self._voronoi_points = np.vstack((self._qx,self._qy)).T
         self._voronoi = Voronoi(self._voronoi_points)
         self._voronoi_vertices = get_voronoi_vertices(
             self._voronoi, self.d.Qshape[0], self.d.Qshape[1])
-
         # show
         print(f"Identified {len(ans)} points")
         if show:
@@ -221,7 +240,6 @@ class ACCHOO:
                 lw=0.5,
                 vp=vp,
             )
-
         # Set up masks libraries
         self._masks_library_1D = [None for idx in range(self.C)]
         self._masks_library_2D = [[None for idx in range(self.C)] for jdx in range(self.C)]
@@ -230,48 +248,50 @@ class ACCHOO:
     ####### Core Algorithm Methods #######
 
     def run(self):
+        if self._verbose:
+            print("Checking if noncrystalline pixels have been IDed...")
         if not self._labelled_empties:
             if self._verbose:
-                print("Empty pixels haven't been cleaned. Cleaning...")
+                print("Noncrystaline pixels search has not been performed. Searching...")
             self.label_empty_pixels()
             self.clean_empty_pixels()
+            if self._verbose:
+                print("Cleaning (morph single iter open/close) noncrystalline pixel mask...")
         if self._verbose:
             print("Entering seed loop...")
         go_forth = True
         while go_forth:
+            if self._verbose:
+                print("Iterating seed loop...")
             go_forth = self._seedloop()
+        if self._verbose:
+            print("Seed loop is complete.")
+            print()
         self._endloop()
 
     def _seedloop(self):
-        # pick a seed...
-        l0 = np.sum(self.labels==0)
-        l5 = np.sum(self.labels==5)
-        l6 = np.sum(self.labels==6)
-        # ...from an unknown pixel
-        if l0>0:
-            seed = self._new_seed(seed_picker=self.seed_picker)
+        iters = 0
+        # pick a seed from an unknown pixel
+        if np.sum(self.labels==0)>0:
             if self._verbose:
-                print(f'Setting out at seed {seed}')
+                print(f'Seed loop iteration {iters}...found an unlabelled pixel.')
+            seed = self._new_seed(seed_picker=self.seed_picker)
             self._reset_path_vars()
+            if self._verbose:
+                print(f'Setting out at seed {seed}!')
             self._new_path(seed)
-            return True
-        # ...from a seeded pixel
-        # ...i think we may not get here. we'll see.
-        elif l5+l6>0:
-            print('seeded path!')
-            print('need to make this still - ending...')
-            return False # TODO
-            seed = self._pick_seeded_seed(seed_picker=self.seed_picker)
-            self._reset_path_vars()
-            self._seeded_path(seed)
             return True
         # are we done?
         else:
+            if self._verbose:
+                print('All empty pixels are accounted for!')
             if not(np.all(self.labels==2)):
                 warnings.warn("Warning: finished but not all pixels have been labelled 'complete'")
+                warnings.warn("Check labels.......")
+                raise Exception('almost there...')
+            if self._verbose:
+                print("Completed seedloop.")
             return False
-        if self._verbose:
-            print("Completed seedloop.")
 
     def _new_seed(self,seed_picker='max'):
         pos = np.where(self.labels==0)
@@ -291,71 +311,68 @@ class ACCHOO:
         else:
             raise Exception(f"Unknown value for seed picker {seed_picker}")
         seed = pos[0][n],pos[1][n]
+        self.seeds.append(seed)
         return seed
 
     def _new_path(self,seed):
-        """ Setup data, find new path crystals, go walking.
-        Then spawn seeded paths.
+        """ Setup data, find new path crystals, go walking, then
+        spawn seeded paths.
         """
-        # setup
-        # get data
+        # setup, get data
         self._data_curr = x,y,inten = self._get_data(seed)
         self._data_channels_curr = self._get_data_channels(x,y)
-        # reset xtal search vars
-        self._b_opts_curr = []
-        self._crystals_curr = []
-        self._crystals_n_opts = 0
-        self._best_score_curr = -1e8
-        self._mask_base_curr = [0]  # mask center beam
-        self._mask_curr = self._mask_base_curr
         # loop - find crystals
+        self._reset_crystal_search_vars()
         loop = True
         while loop:
             if self._verbose:
                 print(f'performing xtal search at {seed}')
             loop = self._xtal_search_loop(seed)
+            if self._verbose:
+                print(f"Found {len(self._crystals_curr)} crystals: {self._crystals_curr}")
         # loop - walk
         self._put_on_shoes_and_coat(seed)
         # finalize current path
         self._finalize_path_and_update_crystals(seed)
-        # check for seeds
-        l34 = np.sum(np.logical_or(self.labels==3,self.labels==4))
         # enter seeded path loops
-        loop = l34>0
+        loop = np.sum(self.labels==3)>0
         while loop:
             seed = self._pick_seeded_seed(seed_picker=self.seed_picker)
             if self._verbose:
                 print(f'setting out at a merged seed path at seed {seed}')
             self._reset_path_vars()
-            seedloop = self._seeded_path(seed)
+            loop = self._seeded_path(seed)
+            loop = np.sum(self.labels==3)>0
             pass
-        # TODO after seeded path loops, all 3/4's have been accounted for
-        # do a finalization - update crystals, labels, path stuff
-        # once 3/4's --> 5/6's, for 5/6s adjacent to current path,
-        # turn back into 3/4s.  Then loop/iterate
+        if self._verbose:
+            print("Exiting _new_path...")
         pass
 
     def _xtal_search_loop(self,seed):
         """ Find a crystal set and mask, then _put_on_shoes_and_coat
         """
+        if self._vv:
+            print('Commencing crystal search...')
         x,y,inten = self._data_curr
+        channels = self._data_channels_curr
         # prepare boolean mask
         # length matches datapoints and True indicates unmasked
         m = np.ones(len(x),dtype=bool)
-        for idx in range(len(x)):
-            if self._data_channels_curr[idx] in self._mask_curr:
-                m[idx] = 0
-            if self._data_channels_curr[idx] in self._b_opts_curr:
+        for idx,channel in enumerate(channels):
+            if channel in self._mask_curr:
                 m[idx] = 0
         # check for data, label and exit if there isn't any
-        if len(x[m]) < self.min:
+        if self._crystals_n_opts==0 and len(x[m]) < self.min:
             self.labels[seed[0],seed[1]] = 2
-            self.noncrystalline[seed[0],seed[1]] = 2
+            self.noncrystalline[seed[0],seed[1]] = True
             return False
         # find crystals
         # first get basis vector options & new crystal options
         # then compute permutation scores and update vars
         self._crystals_n_opts += 1
+        for idx,channel in enumerate(channels):
+            if channels[idx] in self._b_opts_curr:
+                m[idx] = 0 # don't pick current opts
         self._get_b_next_opts(m)
         crystal_opts, mask_opts = self._get_crystal_opts_curr()
         self._score_crystal_options_and_update(crystal_opts,mask_opts)
@@ -367,98 +384,53 @@ class ACCHOO:
             # ...yes? store variables and return
             self._path_crystals = self._crystals_curr
             self._path_mask = self._mask_curr
+            self._path_crystal_indices = [-1]*len(self._crystals_curr)
             self._scores[seed[0],seed[1]] = self._best_score_curr
             self.labels[seed[0],seed[1]] = 1
             return False
 
+    def _pick_seeded_seed(self,seed_picker='max'):
+        pos = np.where(np.logical_or(self.labels==3,self.labels==4))
+        n_seeds = len(pos[0])
+        assert(n_seeds>0), "no current seed pixels (label= 3 or 4) found when a seeded pixel was requested"
+        assert(seed_picker in ['max','most','random','front','back',]), f"Unknown value for seed picker {seed_picker}!"
+        if seed_picker == 'random':
+            n = np.random.randint(0,n_empty)
+        elif seed_picker == 'max':
+            n = np.argmax(self._inten_tot[pos])
+        elif seed_picker == 'most':
+            n = np.argmax(self._n_data_points[pos])
+        elif seed_picker == 'back':
+            n = -1
+        elif seed_picker == 'front':
+            n = 0
+        else:
+            raise Exception(f"Unknown value for seed picker {seed_picker}")
+        seed = pos[0][n],pos[1][n]
+        self.seeds.append(seed)
+        return seed
+
     def _seeded_path(self,seed):
         """ Setup data, find xtals wrt existing xtals, go walking.
         """
-        # setup - set data
+        # setup, get data
         self._data_curr = x,y,inten = self._get_data(seed)
         self._data_channels_curr = self._get_data_channels(x,y)
-        # reset xtal search vars
-        self._b_opts_curr = []
-        self._crystals_curr = []
-        self._best_score_curr = -1e8
-        self._mask_base_curr = [0]  # mask center beam
-        self._mask_curr = self._mask_base_curr
-        # get label
-        label = self.labels[seed[0],seed[1]]
-        assert(label in (3,4)), "seeded path seed label must be 3 or 4"
-        #  remove or add or add&remove
-        if label == 3:
-            loop = True
-            while loop:
-                loop = self._xtal_search_loop_remove(seed)
-        else:
-            loop = True
-            while loop:
-                loop = self._xtal_search_loop_add(seed)
-        raise Exception('hello dolly')
+        # crystal search
+        self._reset_crystal_search_vars()
+        self._xtal_search_seeded(seed)
         # loop - walk
-        #self._put_on_shoes_and_coat(seed)
+        self._put_on_shoes_and_coat_internal(seed)
         # finalize current path
-        #self._finalize_path_and_update_crystals(seed) # TODO - does this method need to be different?
-        # check for seeds
-        #l34 = np.sum(np.logical_or(self.labels==3,self.labels==4)) # TODO - finish - how to exit loop?
+        self._finalize_path_and_update_crystals(seed)
+        # pass
 
-    def _xtal_search_loop_remove(self,seed):
-        """ Gather xtals and masks from neighbors, then try
-        removing xtals until minimal mask is found. store path xtals and mask
-        """
-        # gather xtals and masks from neighbors
-        xtals = []
-        masks = []
-        coords = [
-            (seed[0]-1,seed[1]),
-            (seed[0],seed[1]-1),
-            (seed[0]+1,seed[1]),
-            (seed[0],seed[1]+1)]
-        s = self.shape
-        for idx in range(3,-1,-1):
-            c = coords[idx]
-            if c[0]<0 or c[0]>=s[0] or c[1]<0 or c[1]>=s[1]:
-                coords.pop(idx)
-        for c in coords:
-            if self.labels[c[0],c[1]] == 2:
-                xtals_curr = self.state_crystals[c[0]][c[1]]
-                for xtal in xtals_curr:
-                    if xtal not in xtals:
-                        xtals.append(xtal)
-                        masks.append(self._get_mask(self.crystals(xtal)))
-        # confirm we found some xtals
-        assert(len(xtals)>0), "this shouldn't be able to happen..."
-        assert(len(xtals)>0), "you can initiate a _new_path_loop instead, but do check labels."
-        # update the current crystals
-        self._crystals_curr = [self.crystals[i] for i in xtals]
-        # try removing xtals
-        loop = True
-        while loop:
-            loop,idx = self._can_remove_crystal(channels)
-            if loop:
-                # remove xtal
-                xtals.pop(idx)
-                masks.pop(idx)
-                self._crystals_curr.pop(idx)
-        # check that cost satisfies thresh
-        channels = self._data_channels_curr
-        mask = self._mask_curr = self._mask_union([self._mask_base_curr]+masks)
-        cost = self._best_score_curr = self._get_cost(channels,self._crystals_curr,mask)
-        assert(cost_composite>self._cost_thresh), 'cost threshold not satisfied - this should not happen here...'
-        # update variables and return
-        self._path_crystals = self._crystals_curr
-        self._path_mask = self._mask_curr
-        self._path_crystal_indices = xtals
-        self._scores[seed[0],seed[1]] = self._best_score_curr
-        self.labels[seed[0],seed[1]] = 1
-        pass
-
-    def _xtal_search_loop_add(self,seed,add=True):
+    def _xtal_search_seeded(self,seed):
         """ Gather xtals and masks from neighbors. First, add new crystals until
         data is accounted for.  Then, try removing crystals. Store path xtals and mask
         """
         # gather xtals and masks from neighbors
+        xtal_inds = []
         xtals = []
         masks = []
         coords = [
@@ -473,29 +445,35 @@ class ACCHOO:
                 coords.pop(idx)
         for c in coords:
             if self.labels[c[0],c[1]] == 2:
-                xtals_curr = self.state_crystals[c[0]][c[1]]
-                for xtal in xtals_curr:
-                    if xtal not in xtals:
+                xtal_inds_curr = self.state_crystals[c[0]][c[1]]
+                for ind in xtal_inds_curr:
+                    if ind not in xtal_inds:
+                        xtal_inds.append(ind)
+                        xtal = self.crystals[ind]
                         xtals.append(xtal)
-                        masks.append(self._get_mask(self.crystals[xtal]))
+                        masks.append(self._get_mask(xtal))
         # confirm we found some xtals
-        assert(len(xtals)>0), "this shouldn't be able to happen..."
-        assert(len(xtals)>0), "you can initiate a _new_path_loop instead, but do check labels."
+        print(seed)
+        assert(len(xtal_inds)>0), "this shouldn't be able to happen..."
+        assert(len(xtal_inds)>0), "you can initiate a _new_path_loop instead, but do check labels."
         # update the current crystals
-        self._crystals_curr = [self.crystals[i] for i in xtals]
+        self._crystals_inds_curr = xtal_inds
+        self._crystals_curr = xtals
+        self._mask_curr = mask = self._mask_union([self._mask_base_curr]+masks)
+        #print(xtal_inds,xtals,mask)
         # get baseline cost
         channels = self._data_channels_curr
-        mask = self._mask_curr = self._mask_union([self._mask_base_curr]+masks)
         cost = self._best_score_curr = self._get_cost(channels,self._crystals_curr,mask)
         # if cost is above thresh, add crystals
-        self._crystals_n_opts = 0
         if cost < self._cost_thresh:
             loop = True
             while loop:
-                loop = self._xtal_search_loop_add_internal(seed,xtals_curr=self._path_crystal_indices)
+                loop = self._xtal_search_seeded_internalloop(seed)
+        # confirm that cost satisfies thresh
+        channels = self._data_channels_curr
+        assert(self._best_score_curr>self._cost_thresh), 'cost threshold not satisfied - this should not happen here... :0'
         # try removing xtals
         loop = True
-        rmved = False
         while loop:
             loop,idx = self._can_remove_crystal(channels)
             if loop:
@@ -503,22 +481,27 @@ class ACCHOO:
                 xtals.pop(idx)
                 masks.pop(idx)
                 self._crystals_curr.pop(idx)
-                rmved = True
-        if rmved:
-            # check that cost satisfies thresh
-            channels = self._data_channels_curr
-            mask = self._mask_curr = self._mask_union([self._mask_base_curr]+masks)
-            cost = self._best_score_curr = self._get_cost(channels,self._crystals_curr,mask)
-            assert(cost_composite>self._cost_thresh), 'cost threshold not satisfied - this should not happen here...'
-            # update variables and return
-            self._path_crystals = self._crystals_curr
-            self._path_mask = self._mask_curr
-            self._path_crystal_indices = xtals
-            self._scores[seed[0],seed[1]] = self._best_score_curr
-            self.labels[seed[0],seed[1]] = 1
-            pass
+                self._crystals_inds_curr.pop(idx)
+                # updating self._mask_curr not req'd here :p
+        # confirm that cost satisfies thresh
+        channels = self._data_channels_curr
+        assert(self._best_score_curr>self._cost_thresh), 'cost threshold not satisfied - this should not happen here... :0'
+        # update variables and return
+        self._path_crystals = self._crystals_curr
+        self._path_mask = self._mask_curr
+        self._path_crystal_indices = self._crystals_inds_curr
+        self._scores[seed[0],seed[1]] = self._best_score_curr
+        self.labels[seed[0],seed[1]] = 1
+        #    # ...yes? store variables and return
+        #    self._path_crystals = self._crystals_curr
+        #    self._path_mask = self._mask_curr
+        #    self._path_crystal_indices = [-1]*len(self._crystals_curr)
+        #    self._scores[seed[0],seed[1]] = self._best_score_curr
+        #    self.labels[seed[0],seed[1]] = 1
+        #    pass
+        pass
 
-    def _xtal_search_loop_add_internal(self,seed,xtals_curr=[]):
+    def _xtal_search_seeded_internalloop(self,seed):
         """ Find a crystal set and mask, then _put_on_shoes_and_coat
         """
         x,y,inten = self._data_curr
@@ -526,32 +509,28 @@ class ACCHOO:
         # length matches datapoints and True indicates unmasked
         m = np.ones(len(x),dtype=bool)
         for idx in range(len(x)):
-            if self._data_channels_curr[idx] in self._mask_curr:
+            chs = self._mask_curr+self._b_opts_curr
+            if self._data_channels_curr[idx] in chs:
                 m[idx] = 0
-            if self._data_channels_curr[idx] in self._b_opts_curr:
-                m[idx] = 0
-        # check for unaccounted data. If none is found, label and exit
-        if len(x[m]) < self.min:
-            # if no xtals existed already, label empty
-            if len(xtals_curr)==0:
-                self.labels[seed[0],seed[1]] = 2
-                self.noncrystalline[seed[0],seed[1]] = 2
-                return False
-            # otherwise, store vars, label, exit
-            else:
-                self._path_crystals = self._crystals_curr
-                self._path_mask = self._mask_curr
-                self._path_crystal_indices = xtals_curr
-                self._scores[seed[0],seed[1]] = self._best_score_curr
-                self.labels[seed[0],seed[1]] = 1
-                return False
         # find crystals
         # first get basis vector options & new crystal options
         # then compute permutation scores and update vars
+        #print('PPOOOH BEAR WAITIN FER YOU BEAR')
+        #print(self._crystals_n_opts)
+        #print(self._b_opts_curr)
+        #print(m)
         self._crystals_n_opts += 1
         self._get_b_next_opts(m)
         crystal_opts, mask_opts = self._get_crystal_opts_curr()
-        self._score_crystal_options_and_update_addxtals(crystal_opts,mask_opts)
+        #print(crystal_opts, mask_opts)
+        #print('out of the honey tree, into the fire')
+        #print(self._data_channels_curr)
+        #print(self._b_opts_curr)
+        #print(crystal_opts)
+        #print(mask_opts)
+        #print(self._best_score_curr)
+        # merge new and existing xtal masks
+        self._score_crystal_options_and_update_addxtal(crystal_opts,mask_opts)
         # are we done?
         if self._best_score_curr < self._cost_thresh:
             # ...no?  iterate
@@ -560,8 +539,7 @@ class ACCHOO:
             # ...yes? store variables and return
             self._path_crystals = self._crystals_curr
             self._path_mask = self._mask_curr
-            neg = [-1]*(len(self._path_mask)-len(self._path_crystal_indices))
-            self._path_crystal_indices += neg # label new crystal's indices as -1
+            self._path_crystal_indices = self._crystals_inds_curr
             self._scores[seed[0],seed[1]] = self._best_score_curr
             self.labels[seed[0],seed[1]] = 1
             return False
@@ -584,28 +562,60 @@ class ACCHOO:
                 while go_walking:
                     go_walking = self._walk()
 
+    def _put_on_shoes_and_coat_internal(self,seed):
+        """ get ready to walk. then, go walking
+        differs in that this is executed from a seeded path,
+        so 3/4 and 5/6 labels need to be handled/navigated
+        need is that current 3/4's can be walked by this walker,
+        and, this walker needs to be able to write/turn-when-bumping
+        its own seeds.
+        """
+        # setup
+        self._reset_path_vars()
+        self._coords.append(seed)
+        self._dirs.append(0)
+        # temporarily label current 3's -> 0's
+        lab3 = self.labels==3
+        self.labels[lab3] = 0
+        # walk
+        go_walking = True
+        while go_walking:
+            go_walking = self._walk()
+        # and back again
+        go_home = True
+        while go_home:
+            go_home = self._backtrack_and_spawn()
+            if go_home:
+                go_walking = True
+                while go_walking:
+                    go_walking = self._walk()
+        # change 3/4s that weren't identified back
+        lab2 = self.labels==2
+        _m = np.logical_and(lab3,np.logical_not(lab2))
+        self.labels[_m] = 3
+        pass
+
     def _walk(self):
         """ look at the label of the pixel ahead.
-        is it 0 or 4? new pixel / old seed - check for mask change, then walk or turn
+        is it 0? if so, new pixel - check for mask change, then walk or turn
         is it 1,2,3 or an edge? turn
         """
         d = self._dirs[self._pos]
         c,l = self._look_ahead()
+        # open - onward!
+        if l == 0:
+            self._new_pixel(c)
+            return True
         # exit catch
-        if len(self._coords)==1 and d==3:
+        elif self._pos==0 and d==3:
             self._single_pixel_shake()
             return False
         # backtrack if we're facing the way we came from
-        if len(self._coords)>1:
-            if np.array_equal(np.array(c),np.array(self._coords[-2])):
-                return False
+        elif self._pos>0 and np.array_equal(np.array(c),np.array(self._coords[-2])):
+            return False
         # unavalable - turn right
-        if l in (-1,1,2,3):
+        elif l in (-1,1,2,3):
             self._dirs[self._pos] = self._right(d)
-            return True
-        # open - onward!
-        elif l in (0,4):
-            self._new_pixel(c)
             return True
         else:
             raise Exception(f'encountered unexpected label {l}')
@@ -615,7 +625,7 @@ class ACCHOO:
         if self._pos == 0:
             return False
         else:
-            # no? orient, step backwards, and remove path end point
+            # no? step backwards, remove path end point, turn left
             p = self._pos
             c_curr = self._coords[p]
             c_prev = self._coords[p-1]
@@ -630,7 +640,7 @@ class ACCHOO:
     def _new_pixel(self,coord):
         """ assess an unknown pixel from an existing path.
         if it is described by the current mask, label 1 and walk
-        if it isn't, label 3 or 4 and turn
+        if it isn't, label 3 and turn
         """
         # get data
         self._data_curr = x,y,inten = self._get_data(coord)
@@ -642,12 +652,11 @@ class ACCHOO:
         can_remove, rm_idx = self._can_remove_crystal(channels)
         if can_remove:
             self.labels[coord[0],coord[1]] = 3
-            self._rmable_index[coord[0],coord[1]] = rm_idx
             self._dirs[self._pos] = self._right(self._dirs[self._pos])
             return True
         # is the threshold maintained? if not, label, turn & return
         elif cost < self._cost_thresh:
-            self.labels[coord[0],coord[1]] = 4
+            self.labels[coord[0],coord[1]] = 3
             self._dirs[self._pos] = self._right(self._dirs[self._pos])
             return True
         # if the threshold is maintained and no crystals can be removed,
@@ -667,106 +676,80 @@ class ACCHOO:
         Updating crystals entails checking if the current crystals are part of existing
         ones or require a new crystal, then merging or creating them
         """
-        # store seed
-        self.seeds.append(seed)
         # store path
+        self.paths.append(self.labels.copy())
+        # find labels 1 & 2 (current, known)
         lab1 = self.labels==1
         lab2 = self.labels==2
-        lab3 = self.labels==3
-        lab4 = self.labels==4
-        ar = np.zeros(self.shape,dtype=int)
-        ar[lab1]=1
-        ar[lab3]=3
-        ar[lab4]=4
-        self.paths.append(ar)
         # update crystals
         # get current crystals & masks
         xtals_curr = self._crystals_curr
         masks_curr = [self._get_mask(xtal) for xtal in xtals_curr]
+        xtals_inds_curr = self._crystals_inds_curr
         # get adjacent labelled pixels
         footprint = np.ones((3,3),dtype=bool)
-        m1 = binary_opening(lab1,structure=footprint)
+        m1 = binary_dilation(lab1,structure=footprint)
         x_coords,y_coords = np.nonzero(np.logical_and(m1,lab2))
-        # get adjacent crystal masks
+        # collect adjacent crystals
         xtals_adj = []
         masks_adj = []
-        adj_indices = []
+        xtals_inds_adj = []
         for x0,y0 in zip(x_coords,y_coords):
-            xtal_inds = self._state_crystals[x0][y0]
-            xtals = [self.crystals[ind] for ind in xtal_inds]
-            for xtal,ind in zip(xtals,xtal_inds):
-                if not xtal in xtals_adj:
+            xtal_inds = self.state_crystals[x0][y0]
+            # check if this crystal is already there before adding
+            for idx,ind in enumerate(xtal_inds):
+                assert(ind != -1), "ind should not be -1 at this point!"
+                xtal = self.crystals[ind]
+                m = self._get_mask(xtal)
+                if not self._xtal_in_xtals(xtal,xtals_adj):
                     xtals_adj.append(xtal)
-                    masks_adj.append(self._get_mask(xtal))
-                    adj_indices.append(ind)
-        # compare their masks - are any crystal masks identical?
-        matches = []
-        for idx,mask in enumerate(masks_curr):
-            for jdx,_mask in enumerate(masks_adj):
-                if self._mask_equal(mask,_mask):
-                    # label true
-                    matches.append((idx,jdx))
-        # track crystal indices for this path (merged or new)
-        _path_crystal_indices = []
-        # perform merge
-        xtals_merged = []
-        for match in matches:
-            # get xtals
-            xtal_curr_idx,xtal_merge_idx_tmp = match
-            xtal_merge_idx = adj_indices[xtal_merge_idx]
-            # has current merging xtal already been merged?
-            # ...if not, flag it and merge 
-            if xtal_curr_idx not in xtals_merged:
-                xtals_merged.append(xtal_curr_idx)
-                # update images and path indices
-                _path_crystal_indices.append(xtal_merge_idx)
-                im_curr = self._crystal_images[xtal_merge_idx]
-                im_curr = np.logical_or(im_curr,lab1)
-                self._crystal_images[xtal_merge_idx] = im_curr
-            # ...if so, flag for later final crystal merge
-            else:
+                    masks_adj.append(m)
+                    assert(ind not in xtals_inds_adj), 'hmmmmmm....'
+                    xtals_inds_adj.append(ind)
+                # if two adjacent pixels have identical masks but
+                # are labelled as distinct crystals, flag for merge
+                for _m,_ind in zip(masks_adj,xtals_inds_adj):
+                    if self._mask_equal(m,_m):
+                        # flag only
+                        # it'll be slow to merge as we go
+                        self._merge_xtals.append((_ind,ind))
+        # compare unknown crystals with adjacent masks
+        # if they match, update the -1 index
+        for i,ind in enumerate(xtals_inds_curr):
+            if ind==-1:
+                for xtal_ind,mask in zip(xtals_inds_adj,masks_adj):
+                    if self._mask_equal(masks_curr[ind],mask):
+                        xtals_inds_curr[i] = xtal_ind
+        # for each of the current path's crystals, either
+        # add it to an existing crystal or create a new one
+        for idx,(xtal,xtal_ind,mask) in enumerate(zip(xtals_curr,xtals_inds_curr,masks_curr)):
+            # new crystals
+            if xtal_ind == -1:
+                # update its index
+                xtal_ind = self.N
+                xtals_inds_curr[idx] = xtal_ind
                 if self._verbose:
-                    print('crystal flagged for final merge, see self._final_crystal_merge')
-                self._final_crystal_merge.append(xtal_merge_idx)
-            pass
-        # otherwise, create new crystals
-        for idx,(xtal,mask) in enumerate(zip(xtals_curr,masks_curr)):
-            if idx not in xtals_merged:
+                    print(f'hark! a new crystal! indexed number {xtal_ind} with basis {xtal}')
+                # add the crystal and its mask and image
                 self.crystals.append(xtal)
                 self.crystal_masks.append(mask)
                 self.crystal_images.append(lab1)
-                jdx = self.N-1
-                _path_crystal_indices.append(jdx)
+            # existing crystals
+            else:
+                # merge images
+                assert(xtal_ind<self.N), f"can't merge into crystal index {xtal_ind} - only {self.N} crystals are present"
+                im = self.crystal_images[xtal_ind]
+                self.crystal_images[xtal_ind] = np.logical_or(im,lab1)
         # populate state vars
         xs,ys = np.nonzero(lab1)
-        for x0,y0 in zip(xs,ys):
-            self.state_crystals[x0][y0] = _path_crystal_indices
-            self.state_masks[x0][y0] = self._path_mask
+        for _x,_y in zip(xs,ys):
+            self.state_crystals[_x][_y] = xtals_inds_curr
+            self.state_masks[_x][_y] = self._mask_curr
         # update labels
-        self.labels[lab1] = 2  # Note: will need to change 3,4-->5,6 after seeded path loops
+        self.labels[lab1] = 2
         # reset path vars
         self._reset_path_vars()
         pass
-
-    def _pick_seeded_seed(self,seed_picker='max'):
-        pos = np.where(np.logical_or(self.labels==3,self.labels==4))
-        n_seeds = len(pos[0])
-        assert(n_seeds>0), "no current seed pixels (label= 3 or 4) found when a seeded pixel was requested"
-        assert(seed_picker in ['max','most','random','front','back',]), f"Unknown value for seed picker {seed_picker}!"
-        if seed_picker == 'random':
-            n = np.random.randint(0,n_empty)
-        elif seed_picker == 'max':
-            n = np.argmax(self._inten_tot[pos])
-        elif seed_picker == 'most':
-            n = np.argmax(self._n_data_points[pos])
-        elif seed_picker == 'back':
-            n = -1
-        elif seed_picker == 'front':
-            n = 0
-        else:
-            raise Exception(f"Unknown value for seed picker {seed_picker}")
-        seed = pos[0][n],pos[1][n]
-        return seed
 
     def _endloop(self):
         """ cleans up
@@ -786,17 +769,6 @@ class ACCHOO:
     ### Cost ###
     def _score_crystal_options_and_update(self,crystals_opts,mask_opts):
         """ compare the scores of all the current options and
-        update with the current best option
-        """
-        for xtals_opt,mask_opt in zip(crystals_opts,mask_opts):
-            cost = self._get_cost(self._data_channels_curr,xtals_opt,mask_opt)
-            if cost > self._best_score_curr:
-                self._crystals_curr = xtals_opt
-                self._mask_curr = mask_opt
-                self._best_score_curr = cost
-
-    def _score_crystal_options_and_update_addxtals(self,crystals_opts,mask_opts):
-        """ compare the scores of all the current options and
         update with the current best option, preserving/appending to the end of
         the self._crystals_curr list
         """
@@ -806,7 +778,24 @@ class ACCHOO:
                 for xtal in xtals_opt:
                     if not self._xtal_in_xtals(xtal,self._crystals_curr):
                         self._crystals_curr.append(xtal)
+                        self._crystals_inds_curr.append(-1) # for tracking new xtals
                 self._mask_curr = mask_opt
+                self._best_score_curr = cost
+
+    def _score_crystal_options_and_update_addxtal(self,crystals_opts,mask_opts):
+        """ compare the scores of all the current options and
+        update with the current best option, preserving/appending to the end of
+        the self._crystals_curr list
+        """
+        for xtals_opt,mask_opt in zip(crystals_opts,mask_opts):
+            mask = self._mask_union([self._mask_curr,mask_opt])
+            cost = self._get_cost(self._data_channels_curr,xtals_opt,mask)
+            if cost > self._best_score_curr:
+                for xtal in xtals_opt:
+                    if not self._xtal_in_xtals(xtal,self._crystals_curr):
+                        self._crystals_curr.append(xtal)
+                        self._crystals_inds_curr.append(-1) # for tracking new xtals
+                self._mask_curr = mask
                 self._best_score_curr = cost
 
     def _get_cost(self, channels, xtals, mask):
@@ -849,15 +838,12 @@ class ACCHOO:
             # get low q options
             q = np.hypot(x[m],y[m])
             qsort_inds = np.argpartition(q,num_lowq)  # lowest to highest q
-            _opts = list(qsort_inds[:num_lowq])
+            opts = list(qsort_inds[:num_lowq])
             # get high inten options
             isort_inds = np.argpartition(inten[m],-num_highi)
-            _opts += list(isort_inds[-num_highi:])
+            opts += list(isort_inds[-num_highi:])
             # rm redundancies
-            opts = []
-            for opt in _opts:
-                if opt not in opts:
-                    opts.append(opt)
+            opts = list(set(opts))
         # for existing set, add 1 new low q and 1 new high i
         else:
             # low q
@@ -867,20 +853,15 @@ class ACCHOO:
             ind = np.argmax(inten[m])
             if ind not in opts:
                 opts += [ind]
+            # remove redundancies
+            opts = list(set(opts))
         # transform to voronoi channel indices
         opts_indices = []
         for opt in opts:
             idx = m_inds[opt]
             opts_indices.append(self._get_channel((x[idx],y[idx])))
         # merge with current best of b options
-        # new set
-        if len(self._b_opts_curr)==0:
-            self._b_opts_curr += opts_indices
-        # existing set
-        else:
-            for opt in opts_indices:
-                if opt not in self._b_opts_curr:
-                    self._b_opts_curr.append(opt)
+        self._b_opts_curr = list(set(self._b_opts_curr + opts_indices))
         # return
         return self._b_opts_curr
 
@@ -893,9 +874,6 @@ class ACCHOO:
         masks_opts = []
         # ensure we have enough b options
         N = self._crystals_n_opts
-        print(N)
-        print(b_opts)
-        print()
         assert(len(b_opts)>=N), "number of b options should not be less than number of crystals!"
         # get b options combinations
         b_combs = list(combinations(b_opts,N))
@@ -1165,9 +1143,10 @@ class ACCHOO:
     # miscellaneous
     def _single_pixel_shake(self):
         if self._verbose:
-            print("\/\** \/ **/\/ ***do the single*pixel shake*** \/\** \/**\/ **/\/")
-            print(f"\/\** \/ **/\/ ***i'm at {self._coords[self._pos]} just do *** \/\** \/**\/ **/\/")
-            print("\/\** \/ **/\/ ***doin a single*pixel shake*** \/\** \/**\/ **/\/")
+            pass
+            #print("\/\** \/ **/\/ ***do the single*pixel shake*** \/\** \/**\/ **/\/")
+            #print(f"\/\** \/ **/\/ ***i'm at {self._coords[self._pos]} just do *** \/\** \/**\/ **/\/")
+            #print("\/\** \/ **/\/ ***doin a single*pixel shake*** \/\** \/**\/ **/\/")
         pass
 
     def _transform_cal_to_pix(self,x,y):
@@ -1568,16 +1547,7 @@ class ACCHOO:
             plt.show()
 
 
-
-
-
-
-
-
-
-
-
-
+        # TODO - construction - finish this method
 
         #########3
         qpixsize = self.d.calibration.get_Q_pixel_size()
@@ -1653,10 +1623,10 @@ class ACCHOO:
         self.thresh_empty = min_inten_empty
     def set_min_inten(self,min_inten):
         self.thresh = min_inten
-    def set_dist_frac_tol(self,dist_frac_tol):
-        self.distance_frac_tolerance = dist_frac_tol
-    def set_numb_frac_tol(self,numb_frac_tol):
-        self.number_frac_tolerance = numb_frac_tol
+    #def set_dist_frac_tol(self,dist_frac_tol):
+    #    self.distance_frac_tolerance = dist_frac_tol
+    #def set_numb_frac_tol(self,numb_frac_tol):
+    #    self.number_frac_tolerance = numb_frac_tol
     def set_seed_picker(self,seed_picker):
         assert(seed_picker in ['max','most','random','front','back',]), f"Unknown value for seed picker {seed_picker}!"
         self.seed_picker = seed_picker
@@ -2006,5 +1976,325 @@ class ACCHOO:
 #                raise Exception(f'an unexpected error has occured; the crystal gen algo needs attention')
 #                sys.exit()
 #                return False
+
+#    def _xtal_search_loop_remove(self,seed):
+#        """ Gather xtals and masks from neighbors, then try
+#        removing xtals until minimal mask is found. store path xtals and mask
+#        """
+#        # gather xtals and masks from neighbors
+#        xtals = []
+#        masks = []
+#        coords = [
+#            (seed[0]-1,seed[1]),
+#            (seed[0],seed[1]-1),
+#            (seed[0]+1,seed[1]),
+#            (seed[0],seed[1]+1)]
+#        s = self.shape
+#        for idx in range(3,-1,-1):
+#            c = coords[idx]
+#            if c[0]<0 or c[0]>=s[0] or c[1]<0 or c[1]>=s[1]:
+#                coords.pop(idx)
+#        for c in coords:
+#            if self.labels[c[0],c[1]] == 2:
+#                xtals_curr = self.state_crystals[c[0]][c[1]]
+#                for xtal in xtals_curr:
+#                    if xtal not in xtals:
+#                        xtals.append(xtal)
+#                        masks.append(self._get_mask(self.crystals(xtal)))
+#        # confirm we found some xtals
+#        assert(len(xtals)>0), "this shouldn't be able to happen..."
+#        assert(len(xtals)>0), "you can initiate a _new_path_loop instead, but do check labels."
+#        # update the current crystals
+#        self._crystals_curr = [self.crystals[i] for i in xtals]
+#        # try removing xtals
+#        loop = True
+#        while loop:
+#            loop,idx = self._can_remove_crystal(channels)
+#            if loop:
+#                # remove xtal
+#                xtals.pop(idx)
+#                masks.pop(idx)
+#                self._crystals_curr.pop(idx)
+#        # check that cost satisfies thresh
+#        channels = self._data_channels_curr
+#        mask = self._mask_curr = self._mask_union([self._mask_base_curr]+masks)
+#        cost = self._best_score_curr = self._get_cost(channels,self._crystals_curr,mask)
+#        assert(cost_composite>self._cost_thresh), 'cost threshold not satisfied - this should not happen here...'
+#        # update variables and return
+#        self._path_crystals = self._crystals_curr
+#        self._path_mask = self._mask_curr
+#        self._path_crystal_indices = xtals
+#        self._scores[seed[0],seed[1]] = self._best_score_curr
+#        self.labels[seed[0],seed[1]] = 1
+#        pass
+
+        # check for unaccounted data. If none is found, label and exit
+        #if len(x[m]) < self.min:
+        #    # if no xtals existed already, label empty
+        #    if len(xtals_curr)==0:
+        #        self.labels[seed[0],seed[1]] = 2
+        #        self.noncrystalline[seed[0],seed[1]] = 2
+        #        return False
+        #    # otherwise, store vars, label, exit
+        #    else:
+        #        self._path_crystals = self._crystals_curr
+        #        self._path_mask = self._mask_curr
+        #        self._path_crystal_indices = xtals_curr
+        #        self._scores[seed[0],seed[1]] = self._best_score_curr
+        #        self.labels[seed[0],seed[1]] = 1
+        #        return False
+
+
+        ### get label
+        #label = self.labels[seed[0],seed[1]]
+        #assert(label in (3,4)), "seeded path seed label must be 3 or 4"
+        ##  remove or add or add&remove
+        #if label == 3:
+        #    loop = True
+        #    while loop:
+        #        loop = self._xtal_search_loop_remove(seed)
+        #else:
+        #    loop = True
+        #    while loop:
+        #        loop = self._xtal_search_loop_add(seed)
+
+#    def _merge_xtals_new(self,ind1,ind2):
+#        """ before finalizing the current path, merge any crystals with matching masks
+#        to adjacent crystals with those existing crystals. For crystals in need of
+#        merging but already indexed, flag by adding to _merge_xtals. For unindexed
+#        crystals, assign the index
+#        """
+#        # track crystal indices for this path (merged or new)
+#        _path_crystal_indices = []
+#        # perform merge
+#        xtals_merged = []
+#        for match in matches:
+#            # get xtals
+#            xtal_curr_idx,xtal_merge_idx_tmp = match
+#            xtal_merge_idx = adj_indices[xtal_merge_idx]
+#            # has current merging xtal already been merged?
+#            # ...if not, flag it and merge 
+#            if xtal_curr_idx not in xtals_merged:
+#                xtals_merged.append(xtal_curr_idx)
+#                # update images and path indices
+#                _path_crystal_indices.append(xtal_merge_idx)
+#                im_curr = self._crystal_images[xtal_merge_idx]
+#                im_curr = np.logical_or(im_curr,lab1)
+#                self._crystal_images[xtal_merge_idx] = im_curr
+#            # ...if so, flag for later final crystal merge
+#            else:
+#                if self._verbose:
+#                    print('crystal flagged for final merge, see self._final_crystal_merge')
+#                self._final_crystal_merge.append(xtal_merge_idx)
+#            pass
+
+
+#        # store seed
+#        self.seeds.append(seed)
+#        # store path
+#        lab1 = self.labels==1
+#        lab2 = self.labels==2
+#        lab3 = self.labels==3
+#        lab4 = self.labels==4
+#        ar = np.zeros(self.shape,dtype=int)
+#        ar[lab1]=1
+#        ar[lab3]=3
+#        ar[lab4]=4
+#        self.paths.append(ar)
+#        # update crystals
+#        # get current crystals & masks
+#        xtals_curr = self._crystals_curr
+#        xtals_inds_curr = self._crystals_inds_curr
+#        masks_curr = [self._get_mask(xtal) for xtal in xtals_curr]
+#        # first write any growing crystals
+#        # then handle new/unknonc crystals, attempting
+#        # to merge with bounding grains
+#        # growing crystals
+#        # ... need to retrieve self._path_crystal_indices...
+#        # ... does it have -1's?
+#        # ... match first ones
+#
+#        # get adjacent labelled pixels
+#        footprint = np.ones((3,3),dtype=bool)
+#        m1 = binary_opening(lab1,structure=footprint)
+#        x_coords,y_coords = np.nonzero(np.logical_and(m1,lab2))
+#        # get adjacent crystal masks
+#        xtals_adj = []
+#        masks_adj = []
+#        adj_indices = []
+#        for x0,y0 in zip(x_coords,y_coords):
+#            xtal_inds = self._state_crystals[x0][y0]
+#            xtals = [self.crystals[ind] for ind in xtal_inds]
+#            for xtal,ind in zip(xtals,xtal_inds):
+#                if not xtal in xtals_adj:
+#                    xtals_adj.append(xtal)
+#                    masks_adj.append(self._get_mask(xtal))
+#                    adj_indices.append(ind)
+#        # compare their masks - are any crystal masks identical?
+#        matches = []
+#        for idx,mask in enumerate(masks_curr):
+#            for jdx,_mask in enumerate(masks_adj):
+#                if self._mask_equal(mask,_mask):
+#                    # label true
+#                    matches.append((idx,jdx))
+#        # track crystal indices for this path (merged or new)
+#        _path_crystal_indices = []
+#        # perform merge
+#        xtals_merged = []
+#        for match in matches:
+#            # get xtals
+#            xtal_curr_idx,xtal_merge_idx_tmp = match
+#            xtal_merge_idx = adj_indices[xtal_merge_idx]
+#            # has current merging xtal already been merged?
+#            # ...if not, flag it and merge 
+#            if xtal_curr_idx not in xtals_merged:
+#                xtals_merged.append(xtal_curr_idx)
+#                # update images and path indices
+#                _path_crystal_indices.append(xtal_merge_idx)
+#                im_curr = self._crystal_images[xtal_merge_idx]
+#                im_curr = np.logical_or(im_curr,lab1)
+#                self._crystal_images[xtal_merge_idx] = im_curr
+#            # ...if so, flag for later final crystal merge
+#            else:
+#                if self._verbose:
+#                    print('crystal flagged for final merge, see self._final_crystal_merge')
+#                self._final_crystal_merge.append(xtal_merge_idx)
+#            pass
+#        # otherwise, create new crystals
+#        for idx,(xtal,mask) in enumerate(zip(xtals_curr,masks_curr)):
+#            if idx not in xtals_merged:
+#                self.crystals.append(xtal)
+#                self.crystal_masks.append(mask)
+#                self.crystal_images.append(lab1)
+#                jdx = self.N-1
+#                _path_crystal_indices.append(jdx)
+#        # populate state vars
+#        xs,ys = np.nonzero(lab1)
+#        for x0,y0 in zip(xs,ys):
+#            self.state_crystals[x0][y0] = _path_crystal_indices
+#            self.state_masks[x0][y0] = self._path_mask
+#        # update labels
+#        self.labels[lab1] = 2  # Note: will need to change 3,4-->5,6 after seeded path loops
+#        # reset path vars
+#        self._reset_path_vars()
+#        pass
+
+
+#    def _finalize_path_and_update_crystals_internal(self,seed):
+#        """ store seed and path; update labels; update crystals; reset path variables
+#        Updating crystals entails checking if the current crystals are part of existing
+#        ones or require a new crystal, then merging or creating them
+#        What's different in internal? The key difference is in how crystals are updated.
+#        Unpack self._path_crystal_indices to merge crystals then make new crystals.
+#        """
+#        # store seed and path
+#        self.seeds.append(seed)
+#        self.paths.append(self.labels.copy())
+#        # find labels 1 & 2 (current, known)
+#        lab1 = self.labels==1
+#        lab2 = self.labels==2
+#        # update crystals
+#        # get current crystals & masks
+#        xtals_curr = self._crystals_curr
+#        xtals_inds_curr = self._crystals_inds_curr
+#        masks_curr = [self._get_mask(xtal) for xtal in xtals_curr]
+#        # check for identical crystals to merge
+#        # get adjacent labelled pixels
+#        footprint = np.ones((3,3),dtype=bool)
+#        m1 = binary_opening(lab1,structure=footprint)
+#        x_coords,y_coords = np.nonzero(np.logical_and(m1,lab2))
+#        # get adjacent crystal masks
+#        xtals_adj = []
+#        masks_adj = []
+#        adj_indices = []
+#        matches_adj = []
+#        for x0,y0 in zip(x_coords,y_coords):
+#            xtal_inds = self._state_crystals[x0][y0]
+#            xtals = [self.crystals[ind] for ind in xtal_inds]
+#            for xtal,ind in zip(xtals,xtal_inds):
+#                if not ind in adj_indices:
+#                    # if two adjacent pixels have identical masks
+#                    # but are labelled as distinct crystals,
+#                    # they should be merged as well
+#                    m = self._get_mask(xtal)
+#                    for jnd,_m in enumerate(masks_adj):
+#                        if self._mask_equal(m,_m):
+#                            matches_adj.append(ind,adj_indices[jnd])
+#                    # otherwise, collect adj xtal data
+#                    else:
+#                        xtals_adj.append(xtal)
+#                        masks_adj.append(m)
+#                        adj_indices.append(ind)
+#        # flag adjacent crystals for merging
+#        for match in matches_adj:
+#            self._merge_xtals((match[0],match[1]))
+#        # compare current and adjacent masks - are any crystal masks identical?
+#        matches = []
+#        for idx,mask in enumerate(masks_curr):
+#            for jdx,_mask in enumerate(masks_adj):
+#                if self._mask_equal(mask,_mask):
+#                    # get indices
+#                    xtal_idx1 = xtals_inds_curr[idx]
+#                    xtal_ind2 = adj_indices[jdx]
+#                    # if they're not identical already, flag true
+#                    if xtal_ind1 != xtal_ind2:
+#                        matches.append((xtal_ind1,xtal_ind2))
+#        # merge any needed current crystals
+#        for match in matches:
+#            ind1,ind2 = match
+#            # If this isn't a new crystal, flag and return
+#            if ind1 != -1
+#                self._merge_xtals.append((ind1,ind2))
+#            # otherwise, update indices
+#            else:
+#                xtals_inds_curr[xtals_inds_curr==ind1] = ind2
+#        # for each current crystal, add to an exist or create a new crystal
+#        for (xtal,xtal_ind,mask) in zip(xtals_curr,xtals_inds_curr,masks_curr):
+#            # new crystals
+#            if xtal_ind == -1:
+#                self.crystals.append(xtal)
+#                self.crystal_masks.append(mask)
+#                self.crystal_images.append(lab1)
+#            # existing crystals
+#            else:
+#                assert(xtal_ind<self.N), f"can't merge into crystal index {xtal_ind} - only {self.N} crystals are present"
+#                im = self.crystal_images(xtal_ind)
+#                im = np.logical_or(im,lab1)
+#                self.crystal_images = im
+#        # populate state vars
+#        xs,ys = np.nonzero(lab1)
+#        for x0,y0 in zip(xs,ys):
+#            self.state_crystals[x0][y0] = xtals_inds_curr
+#            self.state_masks[x0][y0] = self._mask_curr
+#        # update labels
+#        self.labels[lab1] = 2
+#        # reset path vars
+#        self._reset_path_vars()
+#        pass
+
+
+    #def _score_crystal_options_and_update(self,crystals_opts,mask_opts):
+    #    """ compare the scores of all the current options and
+    #    update with the current best option
+    #    """
+    #    for xtals_opt,mask_opt in zip(crystals_opts,mask_opts):
+    #        cost = self._get_cost(self._data_channels_curr,xtals_opt,mask_opt)
+    #        if cost > self._best_score_curr:
+    #            self._crystals_curr = xtals_opt
+    #            self._mask_curr = mask_opt
+    #            self._best_score_curr = cost
+
+    #def _score_crystal_options_and_update_addxtals(self,crystals_opts,mask_opts):
+
+
+#        elif l3>0:
+#            print('seeded path!')
+#            print('THIS SHOULD NOT HAPPEN - seeded pixels should be handled in the new_path loop before it returns...')
+#            print('need to make this still - ending...')
+#            raise Exception('shouldnt happen....')
+#            seed = self._pick_seeded_seed(seed_picker=self.seed_picker)
+#            self._reset_path_vars()
+#            self._seeded_path(seed)
+#            return True
 
 
