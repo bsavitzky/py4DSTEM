@@ -436,9 +436,13 @@ class ACCHOO:
             (seed[0]-1,seed[1]),
             (seed[0],seed[1]-1),
             (seed[0]+1,seed[1]),
-            (seed[0],seed[1]+1)]
+            (seed[0],seed[1]+1),
+            (seed[0]-1,seed[1]-1),
+            (seed[0]-1,seed[1]+1),
+            (seed[0]+1,seed[1]-1),
+            (seed[0]+1,seed[1]+1)]
         s = self.shape
-        for idx in range(3,-1,-1):
+        for idx in range(len(coords)-1,-1,-1):
             c = coords[idx]
             if c[0]<0 or c[0]>=s[0] or c[1]<0 or c[1]>=s[1]:
                 coords.pop(idx)
@@ -491,13 +495,6 @@ class ACCHOO:
         self._path_crystal_indices = self._crystals_inds_curr
         self._scores[seed[0],seed[1]] = self._best_score_curr
         self.labels[seed[0],seed[1]] = 1
-        #    # ...yes? store variables and return
-        #    self._path_crystals = self._crystals_curr
-        #    self._path_mask = self._mask_curr
-        #    self._path_crystal_indices = [-1]*len(self._crystals_curr)
-        #    self._scores[seed[0],seed[1]] = self._best_score_curr
-        #    self.labels[seed[0],seed[1]] = 1
-        #    pass
         pass
 
     def _xtal_search_seeded_internalloop(self,seed):
@@ -514,20 +511,9 @@ class ACCHOO:
         # find crystals
         # first get basis vector options & new crystal options
         # then compute permutation scores and update vars
-        #print('PPOOOH BEAR WAITIN FER YOU BEAR')
-        #print(self._crystals_n_opts)
-        #print(self._b_opts_curr)
-        #print(m)
         self._crystals_n_opts += 1
         self._get_b_next_opts(m)
         crystal_opts, mask_opts = self._get_crystal_opts_curr()
-        #print(crystal_opts, mask_opts)
-        #print('out of the honey tree, into the fire')
-        #print(self._data_channels_curr)
-        #print(self._b_opts_curr)
-        #print(crystal_opts)
-        #print(mask_opts)
-        #print(self._best_score_curr)
         # merge new and existing xtal masks
         self._score_crystal_options_and_update_addxtal(crystal_opts,mask_opts)
         # are we done?
@@ -588,7 +574,7 @@ class ACCHOO:
                 go_walking = True
                 while go_walking:
                     go_walking = self._walk()
-        # change 3/4s that weren't identified back
+        # change 3s that weren't identified back
         lab2 = self.labels==2
         _m = np.logical_and(lab3,np.logical_not(lab2))
         self.labels[_m] = 3
@@ -1181,11 +1167,13 @@ class ACCHOO:
         c_seed='springgreen',
         marker='x',
         vp={'vmin':0,'vmax':2},
+        verbose=False,
         returnfig=False,
         ):
         coord = self.seeds[idx]
         ar = self.paths[idx]
-        print(f'Showing path seeded at {coord}')
+        if verbose:
+            print(f'Showing path seeded at {coord}')
         fig,ax = show(ar,mask=~self.noncrystalline,
             mask_color=c_amorph,cmap=cmap,returnfig=True, **vp)
         ax.scatter(coord[1],coord[0],color=c_seed,marker=marker)
@@ -1240,13 +1228,12 @@ class ACCHOO:
     def show_data_mask_compare(self,coord,mask_alpha=0.4,mask_color='y',
         c='lightcyan',lw=0.5,marker='x',markercolor='blue',markersize=100,
         vectors=False,vect_cmap='cool',vect_width=0.5,vect_headsize=6,vectp={},
-        vp={},returnfig=False):
+        vp={},verbose=False,returnfig=False):
         """ show the data points, mask, voronoi, bvm overlaid
         """
         rx,ry = coord
         mask = self.state_masks[rx][ry]
-
-
+        # show voronoi diagram
         fig,ax = self.show_voronoi_mask(
             mask = mask,
             c = c,
@@ -1298,7 +1285,8 @@ class ACCHOO:
                         'width':vect_width,
                         'head_width':vect_headsize,
                     }, **vectp))
-            print(f"crystal channels: {crystals}")
+            if verbose:
+                print(f"crystal channels: {crystals}")
         # return
         if returnfig:
             return fig,ax
@@ -1456,148 +1444,17 @@ class ACCHOO:
         # show diffraction pattern
         dp = self._datacube[rx,ry]
         if dp_invert:
-            ax2.invert_yaxis()
+            dp = dp.T
         if dp_rotate!=0:
             dp = np.rot90(dp, k=dp_rotate)
         show(dp, figax=(fig,ax2), **dpp)
         # return
         if returnfig:
-            return fig,ax
+            return fig,(ax,ax2)
         else:
             plt.show()
 
 
-
-
-
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
-
-
-
-################
-
-    def show_data_mask_compare(self,coord,mask_alpha=0.4,mask_color='y',
-        c='lightcyan',lw=0.5,marker='x',markercolor='blue',markersize=100,
-        vectors=False,vect_cmap='cool',vect_width=0.5,vect_headsize=6,vectp={},
-        vp={},returnfig=False):
-        """ show the data points, mask, voronoi, bvm overlaid
-        """
-        rx,ry = coord
-        mask = self.state_masks[rx][ry]
-        fig,ax = self.show_voronoi_mask(
-            mask = mask,
-            c = c,
-            lw = lw,
-            vp = vp,
-            mask_alpha=0.4,
-            returnfig=True
-        )
-        qpixsize = self.d.calibration.get_Q_pixel_size()
-        origin = self.d.calibration.get_origin_mean()
-        d = self.d.cal[rx,ry].data
-        x,y = d['qx'],d['qy']
-        x,y = self._transform_cal_to_pix(x,y)
-        ax.scatter(y,x,color=markercolor,s=markersize,marker=marker)
-        # if vectors were requested, add them
-        if vectors:
-            # set up vectors
-            crystal_inds = self.state_crystals[coord[0]][coord[1]]
-            crystals = [self.crystals[idx] for idx in crystal_inds]
-            crystals_vectors = []
-            for xtal in crystals:
-                if len(xtal)==1:
-                    i = xtal[0]
-                    x,y = self.qx[i],self.qy[i]
-                    x,y = self._transform_cal_to_pix(x,y)
-                    crystals_vectors.append(((x,y),))
-                elif len(xtal)==2:
-                    i,j = xtal[0],xtal[1]
-                    x1,y1 = self.qx[i],self.qy[i]
-                    x1,y1 = self._transform_cal_to_pix(x1,y1)
-                    x2,y2 = self.qx[j],self.qy[j]
-                    x2,y2 = self._transform_cal_to_pix(x2,y2)
-                    crystals_vectors.append(((x1,y1),(x2,y2)))
-            # set up colors
-            l = len(crystals_vectors)
-            cm = plt.get_cmap(vect_cmap)
-            colors = [cm(n/l) for n in range(l)]
-            # plot vectors
-            origin = self.d.calibration.get_origin_mean()
-            origin=tuple([x*self.upsample for x in origin])
-            for xtalvs,color in zip(crystals_vectors,colors):
-                for v in xtalvs:
-                    add_vector(ax,d=dict({
-                        'x0':origin[0],
-                        'y0':origin[1],
-                        'vx':v[0]-origin[0],
-                        'vy':v[1]-origin[1],
-                        'color':color,
-                        'width':vect_width,
-                        'head_width':vect_headsize,
-                    }, **vectp))
-            print(f"crystal channels: {crystals}")
-        # return
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
-
-
-        # TODO - construction - finish this method
-
-        #########3
-        qpixsize = self.d.calibration.get_Q_pixel_size()
-        origin = self.d.calibration.get_origin_mean()
-        d = self.d.cal[rx,ry].data
-        x,y = d['qx'],d['qy']
-        x,y = self._transform_cal_to_pix(x,y)
-        ax.scatter(y,x,color=markercolor,s=markersize,marker=marker)
-        # if vectors were requested, add them
-        if vectors:
-            # set up vectors
-            crystal_inds = self.state_crystals[coord[0]][coord[1]]
-            crystals = [self.crystals[idx] for idx in crystal_inds]
-            crystals_vectors = []
-            for xtal in crystals:
-                if len(xtal)==1:
-                    i = xtal[0]
-                    x,y = self.qx[i],self.qy[i]
-                    x,y = self._transform_cal_to_pix(x,y)
-                    crystals_vectors.append(((x,y),))
-                elif len(xtal)==2:
-                    i,j = xtal[0],xtal[1]
-                    x1,y1 = self.qx[i],self.qy[i]
-                    x1,y1 = self._transform_cal_to_pix(x1,y1)
-                    x2,y2 = self.qx[j],self.qy[j]
-                    x2,y2 = self._transform_cal_to_pix(x2,y2)
-                    crystals_vectors.append(((x1,y1),(x2,y2)))
-            # set up colors
-            l = len(crystals_vectors)
-            cm = plt.get_cmap(vect_cmap)
-            colors = [cm(n/l) for n in range(l)]
-            # plot vectors
-            origin = self.d.calibration.get_origin_mean()
-            origin=tuple([x*self.upsample for x in origin])
-            for xtalvs,color in zip(crystals_vectors,colors):
-                for v in xtalvs:
-                    add_vector(ax,d=dict({
-                        'x0':origin[0],
-                        'y0':origin[1],
-                        'vx':v[0]-origin[0],
-                        'vy':v[1]-origin[1],
-                        'color':color,
-                        'width':vect_width,
-                        'head_width':vect_headsize,
-                    }, **vectp))
-            print(f"crystal channels: {crystals}")
-        # return
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
 
     ### Convenience Properties ###
     @property
