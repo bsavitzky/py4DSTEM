@@ -106,16 +106,6 @@ class ACCHOO:
             threshold intensity for data points to be counted as 'empty' or not
         min_inten : bool
             data inclusion intensity threshold
-        #dist_frac_tol : number
-        #    data points which are just over a voronoi ridge from a masked to an
-        #    unmasked channel may be ignored if the distance fraction
-        #    (dist_to_masked_vor_point / dis_to_unmasked_vor_point) is under this
-        #    threshold tolerance. 1 (default) is no tolerance; 1.05 means if the
-        #    distance to the closest masked seed is within 5% of the closest
-        #    unmasked seed distance, the point is disregarded
-        #numb_frac_tol : number
-        #    unmasked data points will be ignored unless their fraction of the total
-        #    number of points is greater than numb_frac_tol
         seed_picker : str in 'max' or 'most' or 'random' or 'front' or 'back'
             strategy for choosing crystal seed points
         num_lowq : int
@@ -225,7 +215,7 @@ class ACCHOO:
         self._voronoi_vertices = get_voronoi_vertices(
             self._voronoi, self.d.Qshape[0], self.d.Qshape[1])
         # show
-        print(f"Identified {len(ans)} points")
+        print(f"Identified {len(ans)} diffraction maxima; setting up voronoi channel data basis.")
         if show:
             show_points(
                 self.bvm,
@@ -280,6 +270,17 @@ class ACCHOO:
                 print(f'Setting out at seed {seed}!')
             self._new_path(seed)
             return True
+        # pick a seed from a seeded pixel
+        elif np.sum(self.labels==3)>0:
+            loop = np.sum(self.labels==3)>0
+            while loop:
+                seed = self._pick_seeded_seed(seed_picker=self.seed_picker)
+                if self._verbose:
+                    print(f'setting out at a merged seed path at seed {seed}')
+                self._reset_path_vars()
+                loop = self._seeded_path(seed)
+                loop = np.sum(self.labels==3)>0
+                pass
         # are we done?
         else:
             if self._verbose:
@@ -329,20 +330,24 @@ class ACCHOO:
             loop = self._xtal_search_loop(seed)
             if self._verbose:
                 print(f"Found {len(self._crystals_curr)} crystals: {self._crystals_curr}")
+                if loop:
+                    print("Score still above threshold, continuing search...")
+                else:
+                    print("Score satisfies threshold, exiting crystal search loop.")
         # loop - walk
         self._put_on_shoes_and_coat(seed)
         # finalize current path
         self._finalize_path_and_update_crystals(seed)
-        # enter seeded path loops
-        loop = np.sum(self.labels==3)>0
-        while loop:
-            seed = self._pick_seeded_seed(seed_picker=self.seed_picker)
-            if self._verbose:
-                print(f'setting out at a merged seed path at seed {seed}')
-            self._reset_path_vars()
-            loop = self._seeded_path(seed)
-            loop = np.sum(self.labels==3)>0
-            pass
+#        # enter seeded path loops
+#        loop = np.sum(self.labels==3)>0
+#        while loop:
+#            seed = self._pick_seeded_seed(seed_picker=self.seed_picker)
+#            if self._verbose:
+#                print(f'setting out at a merged seed path at seed {seed}')
+#            self._reset_path_vars()
+#            loop = self._seeded_path(seed)
+#            loop = np.sum(self.labels==3)>0
+#            pass
         if self._verbose:
             print("Exiting _new_path...")
         pass
@@ -350,8 +355,6 @@ class ACCHOO:
     def _xtal_search_loop(self,seed):
         """ Find a crystal set and mask, then _put_on_shoes_and_coat
         """
-        if self._vv:
-            print('Commencing crystal search...')
         x,y,inten = self._data_curr
         channels = self._data_channels_curr
         # prepare boolean mask
@@ -372,7 +375,8 @@ class ACCHOO:
         for idx,channel in enumerate(channels):
             if channels[idx] in self._b_opts_curr:
                 m[idx] = 0 # don't pick current opts
-        self._get_b_next_opts(m)
+        if len(x[m])>0:
+            self._get_b_next_opts(m)
         crystal_opts, mask_opts = self._get_crystal_opts_curr()
         self._score_crystal_options_and_update(crystal_opts,mask_opts)
         # are we done?
@@ -512,7 +516,8 @@ class ACCHOO:
         # first get basis vector options & new crystal options
         # then compute permutation scores and update vars
         self._crystals_n_opts += 1
-        self._get_b_next_opts(m)
+        if len(x[m])>0:
+            self._get_b_next_opts(m)
         crystal_opts, mask_opts = self._get_crystal_opts_curr()
         # merge new and existing xtal masks
         self._score_crystal_options_and_update_addxtal(crystal_opts,mask_opts)
@@ -890,8 +895,6 @@ class ACCHOO:
                     masks_opts.append(mask_curr)
         # return
         return crystals_opts, masks_opts
-
-    ### Misc. Utilities ###
 
     # data
     def _get_data(self,seed):
