@@ -2,7 +2,7 @@ import numpy as np
 from typing import Union, Optional
 from scipy.optimize import curve_fit
 
-from py4DSTEM.process.diffraction.utils import Orientation, calc_1D_profile
+from py4DSTEM.diffraction.utils import Orientation, calc_1D_profile
 
 try:
     from pymatgen.symmetry.analyzer import SpacegroupAnalyzer

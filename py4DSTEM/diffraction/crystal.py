@@ -11,7 +11,7 @@ import warnings
 from emdfile import PointList
 from py4DSTEM.utils import single_atom_scatter, electron_wavelength_angstrom
 
-from py4DSTEM.process.diffraction.utils import Orientation
+from py4DSTEM.diffraction.utils import Orientation
 
 
 class Crystal:
@@ -25,7 +25,7 @@ class Crystal:
     # (see https://stackoverflow.com/a/47562412)
 
     # Automated Crystal Orientation Mapping is implemented in crystal_ACOM.py
-    from py4DSTEM.process.diffraction.crystal_ACOM import (
+    from py4DSTEM.diffraction.crystal_ACOM import (
         orientation_plan,
         match_orientations,
         match_single_pattern,
@@ -38,7 +38,7 @@ class Crystal:
         save_ang_file,
     )
 
-    from py4DSTEM.process.diffraction.crystal_viz import (
+    from py4DSTEM.diffraction.crystal_viz import (
         plot_structure,
         plot_structure_factors,
         plot_scattering_intensity,
@@ -50,13 +50,13 @@ class Crystal:
         plot_cluster_size,
     )
 
-    from py4DSTEM.process.diffraction.crystal_calibrate import (
+    from py4DSTEM.diffraction.crystal_calibrate import (
         calibrate_pixel_size,
         calibrate_unit_cell,
     )
 
     # Dynamical diffraction calculations are implemented in crystal_bloch.py
-    from py4DSTEM.process.diffraction.crystal_bloch import (
+    from py4DSTEM.diffraction.crystal_bloch import (
         generate_dynamical_diffraction_pattern,
         generate_CBED,
         calculate_dynamical_structure_factors,
@@ -257,7 +257,7 @@ class Crystal:
         lat_new = self.lat_real @ deformation_matrix
 
         # make new crystal class
-        from py4DSTEM.process.diffraction import Crystal
+        from py4DSTEM.diffraction import Crystal
 
         crystal_strained = Crystal(
             positions=self.positions.copy(),
@@ -960,7 +960,7 @@ class Crystal:
         intensity_unique = np.bincount(inv, weights=intensity)
 
         if plot_rings is True:
-            from py4DSTEM.process.diffraction.crystal_viz import plot_ring_pattern
+            from py4DSTEM.diffraction.crystal_viz import plot_ring_pattern
 
             plot_ring_pattern(radii_unique, intensity_unique, **plot_params)
 

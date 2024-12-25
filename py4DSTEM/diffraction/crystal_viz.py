@@ -15,7 +15,7 @@ import numpy as np
 from typing import Union, Optional
 
 from emdfile import tqdmnd, PointList, PointListArray
-from py4DSTEM.process.diffraction.utils import calc_1D_profile
+from py4DSTEM.diffraction.utils import calc_1D_profile
 
 
 def plot_structure(

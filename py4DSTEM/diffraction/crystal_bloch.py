@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from emdfile import PointList
 from py4DSTEM.utils import electron_wavelength_angstrom, single_atom_scatter
-from py4DSTEM.process.diffraction.WK_scattering_factors import compute_WK_factor
+from py4DSTEM.diffraction.WK_scattering_factors import compute_WK_factor
 
 
 @dataclass

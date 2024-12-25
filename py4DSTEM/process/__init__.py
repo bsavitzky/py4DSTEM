@@ -3,6 +3,5 @@ from py4DSTEM.process.strain.strain import StrainMap
 
 from py4DSTEM.process import phase
 from py4DSTEM.process import calibration
-from py4DSTEM.process import diffraction
 from py4DSTEM.process import wholepatternfit
 

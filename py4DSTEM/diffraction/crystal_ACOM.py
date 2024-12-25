@@ -5,7 +5,7 @@ from tqdm import tqdm
 
 from emdfile import tqdmnd, PointList, PointListArray
 from py4DSTEM.data import RealSlice
-from py4DSTEM.process.diffraction.utils import Orientation, OrientationMap, axisEqual3D
+from py4DSTEM.diffraction.utils import Orientation, OrientationMap, axisEqual3D
 from py4DSTEM.utils import electron_wavelength_angstrom
 
 from warnings import warn
@@ -2256,7 +2256,7 @@ def orientation_map_to_orix_CrystalMap(
 
     from scipy.spatial.transform import Rotation as R
 
-    from py4DSTEM.process.diffraction.utils import element_symbols
+    from py4DSTEM.diffraction.utils import element_symbols
 
     import warnings
 
