@@ -96,7 +96,7 @@ class Crystal:
         # [a a a 90 90 90]
         # [a b c 90 90 90]
         # [a b c alpha beta gamma]
-        cell = np.asarray(cell, dtype="float_")
+        cell = np.asarray(cell, dtype=np.float64)
         if np.size(cell) == 1:
             self.cell = np.hstack([cell, cell, cell, 90, 90, 90])
         elif np.size(cell) == 3:
@@ -349,7 +349,7 @@ class Crystal:
 
         parser = CifParser(CIF)
 
-        structure = parser.get_structures(primitive=primitive)[0]
+        structure = parser.parse_structures(primitive=primitive)[0]
 
         return Crystal.from_pymatgen_structure(
             structure, conventional_standard_structure=conventional_standard_structure
@@ -652,7 +652,7 @@ class Crystal:
         # Calculate single atom scattering factors
         # Note this can be sped up a lot, but we may want to generalize to allow non-1.0 occupancy in the future.
         f_all = np.zeros(
-            (np.size(self.g_vec_leng, 0), self.positions.shape[0]), dtype="float_"
+            (np.size(self.g_vec_leng, 0), self.positions.shape[0]), dtype=np.float64
         )
         for a0 in range(self.positions.shape[0]):
             atom_sf = single_atom_scatter([self.numbers[a0]], [1], self.g_vec_leng, "A")
