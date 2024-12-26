@@ -798,6 +798,77 @@ class BraggVectorMethods:
         else:
             return
 
+    def mask_vectors(self, Rmask, Qmask=None, Qrange=None, update_inplace=False,
+        returncalc=True):
+        """
+        Remove peaks which fall inside both the realspace mask and diffraction
+        space mask.
+
+        Parameters
+        ----------
+        Rmask : 2d boolean array
+            Real space mask
+        Qmask : 2d boolean mask
+            Diffraction space mask. Either this or Qrange must be passed, but
+            not both
+        Qrange : 2-tuple
+            Calibrated inner and outer radii of the region to threshold
+            in diffractoin space mask. Either this or Qmask must be passed,
+            but not both
+        update_inplace : bool
+            If False (default) makes and returns a copy of the BraggVectors
+            instance. Otherwise, removes the peaks from this instance.
+        returncalc : bool
+            Toggles returning the answer
+        """
+        assert(not(Qmask is not None and Qrange is not None)), "one of Qmask and Qrange must be passed; not both"
+        assert(Qmask is not None or Qrange is not None), "one of Qmask and Qrange must be passed; not both"
+        # Copy peaks, if requested
+        if update_inplace:
+            v = self._v_uncal
+        else:
+            v = self._v_uncal.copy(name="_v_uncal")
+
+        # compute
+        # for boolean Qmasks
+        if Qmask is not None:
+            # loop and remove masked peaks
+            for rx in range(v.shape[0]):
+                for ry in range(v.shape[1]):
+                    if Rmask[rx,ry]:
+                        p = v[rx, ry]
+                        xs = np.round(p.data["qx"]).astype(int)
+                        ys = np.round(p.data["qy"]).astype(int)
+                        sub = Qmask[xs, ys]
+                        p.remove(sub)
+        # for annular Qmasks
+        else:
+            # loop and remove masked peaks
+            for rx in range(v.shape[0]):
+                for ry in range(v.shape[1]):
+                    if Rmask[rx,ry]:
+                        p = v[rx, ry]
+                        pcal = self.cal[rx,ry]
+                        q = np.hypot(pcal.qx,pcal.qy)
+                        sub = np.logical_and(q>Qrange[0],q<=Qrange[1])
+                        p.remove(sub)
+
+        # assign the return value
+        if update_inplace:
+            ans = self
+        else:
+            ans = self.copy(name=self.name + "_masked")
+            ans.set_raw_vectors(v)
+
+        # return
+        if returncalc:
+            return ans
+        else:
+            return
+
+
+        pass
+
     def to_strainmap(self, name: str = None):
         """
         Generate a StrainMap object from the BraggVectors
