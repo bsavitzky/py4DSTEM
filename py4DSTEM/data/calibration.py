@@ -916,5 +916,181 @@ class Calibration(Metadata):
         # return
         return cal
 
+    # utility methods
+
+    def semical_to_raw(self,data):
+        """
+        Transforms x,y positions from semi-calibrated to raw coordinates.
+        "Semi-calibrated" here refers to the specific situation of positions
+        in a calibrated Bragg vector histogram.  In this case, calibrations
+        have been applied, then the data has been discretized into a histogram
+        such that it is now again in pixelated coordinates, with its origin
+        at some pixel position (self.get_origin_mean()).
+
+        Parameters
+        ----------
+        data : structured array with fields 'qx' and 'qy' OR 'x' and 'y'
+
+        Returns
+        -------
+        structured array with fields 'qx' and 'qy'
+        """
+        # prepare data
+        # check for fields (qx,qy) or (x,y)
+        fields = data.dtype.names
+        if 'qx' in fields and 'qy' in fields:
+            # copy data
+            ans = np.copy(data)
+        elif 'x' in fields and 'y' in fields:
+            dt = []
+            for f in data.dtype.fields:
+                if f=='x':
+                    s = 'qx'
+                elif f=='y':
+                    s = 'qy'
+                else:
+                    s = f
+                dt.append((s,data.dtype.fields[f][0]))
+            ans = np.zeros(len(data),dtype=dt)
+            for f in data.dtype.fields:
+                if f=='x':
+                    ans['qx'] = data['x']
+                elif f=='y':
+                    ans['qy'] = data['y']
+                else:
+                    ans[f] = data[f]
+        # get calibrations
+        origin = self.get_origin_mean()
+        ellipse = self.get_ellipse()
+        pixel = self.get_Q_pixel_size()
+        flip = self.get_QR_flip()
+        theta = self.get_QR_rotation()
+        for _ in (origin,ellipse,pixel,flip,theta):
+            assert(_ is not None), 'cal_to_raw requires fully calibrated data!'
+        # center
+        ans['qx'] -= origin[0]
+        ans['qy'] -= origin[1]
+        # pixel
+        # in principle we should tranform to pixel calibrated coordinates,
+        # perform the rotation / elliptical correction / inversion, then
+        # convert back to pixel coordinates.  However, as these operations
+        # should commute with scaling by the pixel size, we'll skip this
+        #ans['qx'] *= pixel
+        #ans['qy'] *= pixel
+        # rotation
+        R = np.array(
+            [[np.cos(theta), np.sin(theta)], [-np.sin(theta), np.cos(theta)]]
+        )
+        positions = R @ np.vstack((ans["qx"], ans["qy"]))
+        # update and perform inversion if needed
+        if flip:
+            ans["qx"] = positions[1, :]
+            ans["qy"] = positions[0, :]
+        else:
+            ans["qx"] = positions[0, :]
+            ans["qy"] = positions[1, :]
+        # pixel
+        # second half of the skipped pixel conversion
+        #ans['qx'] /= pixel
+        #ans['qy'] /= pixel
+        # ellipse
+        a,b,theta = ellipse
+        e = b/a
+        sint,cost = np.sin(theta-np.pi/2), np.cos(theta-np.pi/2)
+        T = np.array([
+            [e*sint**2 + cost**2, sint*cost*(1-e)],
+            [sint*cost*(1-e), sint**2 + e*cost**2],
+        ])
+        T_inv = np.linalg.inv(T)
+        xyarr_i = np.vstack([ans['qx'],ans['qy']])
+        xyarr_f = np.matmul(T_inv, xyarr_i)
+        ans['qx'] = xyarr_f[0,:]
+        ans['qy'] = xyarr_f[1,:]
+        # center
+        ans['qx'] += origin[0]
+        ans['qy'] += origin[1]
+        # return
+        return ans
+
+    def cal_to_raw(self,data):
+        """
+        Transforms x,y positions from calibrated to raw coordinates.
+
+        Parameters
+        ----------
+        data : structured array with fields 'qx' and 'qy' OR 'x' and 'y'
+
+        Returns
+        -------
+        structured array with fields 'qx' and 'qy'
+        """
+        # prepare data
+        # check for fields (qx,qy) or (x,y)
+        fields = data.dtype.names
+        if 'qx' in fields and 'qy' in fields:
+            # copy data
+            ans = np.copy(data)
+        elif 'x' in fields and 'y' in fields:
+            dt = []
+            for f in data.dtype.fields:
+                if f=='x':
+                    s = 'qx'
+                elif f=='y':
+                    s = 'qy'
+                else:
+                    s = f
+                dt.append((s,data.dtype.fields[f][0]))
+            ans = np.zeros(len(data),dtype=dt)
+            for f in data.dtype.fields:
+                if f=='x':
+                    ans['qx'] = data['x']
+                elif f=='y':
+                    ans['qy'] = data['y']
+                else:
+                    ans[f] = data[f]
+        # get calibrations
+        origin = self.get_origin_mean()
+        ellipse = self.get_ellipse()
+        pixel = self.get_Q_pixel_size()
+        flip = self.get_QR_flip()
+        theta = self.get_QR_rotation()
+        for _ in (origin,ellipse,pixel,flip,theta):
+            assert(_ is not None), 'cal_to_raw requires fully calibrated data!'
+        # transform coordinates
+        # rotation
+        R = np.array(
+            [[np.cos(theta), np.sin(theta)], [-np.sin(theta), np.cos(theta)]]
+        )
+        positions = R @ np.vstack((ans["qx"], ans["qy"]))
+        # update
+        if flip:
+            ans["qx"] = positions[1, :]
+            ans["qy"] = positions[0, :]
+        else:
+            ans["qx"] = positions[0, :]
+            ans["qy"] = positions[1, :]
+        # pixel
+        ans['qx'] /= pixel
+        ans['qy'] /= pixel
+        # ellipse
+        a,b,theta = ellipse
+        e = b/a
+        sint,cost = np.sin(theta-np.pi/2), np.cos(theta-np.pi/2)
+        T = np.array([
+            [e*sint**2 + cost**2, sint*cost*(1-e)],
+            [sint*cost*(1-e), sint**2 + e*cost**2],
+        ])
+        T_inv = np.linalg.inv(T)
+        xyarr_i = np.vstack([ans['qx'],ans['qy']])
+        xyarr_f = np.matmul(T_inv, xyarr_i)
+        ans['qx'] = xyarr_f[0,:]
+        ans['qy'] = xyarr_f[1,:]
+        # center
+        ans['qx'] += origin[0]
+        ans['qy'] += origin[1]
+        # return
+        return ans
+
 
 ########## End of class ##########
+

@@ -3,7 +3,7 @@
 
 import warnings
 
-from emdfile import Node, Root
+from emdfile import Node, Root, Metadata
 from py4DSTEM.data import Calibration
 
 
@@ -131,7 +131,7 @@ class Data:
 
     @calibration.setter
     def calibration(self, x):
-        assert isinstance(x, Calibration)
+        assert isinstance(x, (Calibration,Metadata))
         if "calibration" in self.root.metadata.keys():
             warnings.warn(
                 "A 'calibration' key already exists in root.metadata - overwriting..."
