@@ -114,13 +114,7 @@ class VoronoiClustering(object):
         # show
         print(f"Identified {len(ans)} diffraction maxima; setting up voronoi channel data basis.")
         if show:
-            show_points(
-                self.bvm,
-                x=self._qx,
-                y=self._qy,
-                open_circles=True,
-                **vp
-            )
+            self.show_kpoints(**vp)
             self.show_voronoi(
                 c='lightcyan',
                 lw=0.5,
@@ -146,6 +140,33 @@ class VoronoiClustering(object):
                             )
                             ind = np.argmin(d)
                             self.X[i, r] = p["intensity"][ind]
+
+    def show_kpoints(self,returnfig=False,**vp):
+        """
+        Show the bragg vector maxima.
+
+        Parameters
+        ----------
+        returnfig : bool
+            toggle returning the figure
+        vp : dict
+            parameter dict to pass to show when visualizing the results
+        """
+        fig,ax = show_points(
+            self.bvm,
+            x=self._qx,
+            y=self._qy,
+            open_circles=True,
+            returnfig=True,
+            **vp
+        )
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+
+
 
     def get_braggpeak_labels(self):
         """ Gets the set of integers specifying the bragg peaks' voronoi regions
@@ -614,7 +635,7 @@ class VoronoiClustering(object):
         self.N_c_next = self.N_c - 1
         return
 
-    def split_i(self,i,sigma=2,thresh=0.25,expand_mask=1,
+    def split_i(self,i,sigma=2,thresh=0.25,expand_mask=1,erode_mask=0,
         minimum_pixels=1):
         """
         If class i contains multiple non-contiguous segments in real space,
@@ -633,6 +654,9 @@ class VoronoiClustering(object):
         expand_mask : int
             number of pixels by which to expand the mask before
             separating into contiguous regions.
+        erode_mask : int
+            number of pixels by which to erode the mask before
+            separating into contiguous regions.
         minimum_pixels : int
             if, after splitting, a potential new class contains
             fewer than this number of pixels, ignore it
@@ -649,13 +673,19 @@ class VoronoiClustering(object):
         mask = class_image > (np.max(class_image) * thresh)
         mask = binary_opening(mask, iterations=1)
         mask = binary_closing(mask, iterations=1)
-        mask = binary_dilation(mask, iterations=expand_mask)
+        if expand_mask>0:
+            mask = binary_dilation(mask, iterations=expand_mask)
+        if erode_mask>0:
+            mask = binary_erosion(mask, iterations=erode_mask)
         # Get connected regions
         labels, nlabels = label(mask, background=0, return_num=True, connectivity=2)
         # Add each region to the new W and H matrices
         for j in range(nlabels):
             mask = labels == (j + 1)
-            mask = binary_erosion(mask, iterations=expand_mask)
+            if expand_mask>0:
+                mask = binary_erosion(mask, iterations=expand_mask)
+            if erode_mask>0:
+                mask = binary_dilation(mask, iterations=erode_mask)
             if np.sum(mask) >= minimum_pixels:
                 # Leave the Bragg peak weightings the same
                 W_next = np.hstack((W_next, self.W[:, i, np.newaxis]))
