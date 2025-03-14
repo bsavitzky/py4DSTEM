@@ -1369,6 +1369,7 @@ class DataCube(
     def select_patterns(
         self,
         pos,
+        data = None,
         colors = None,
         show = True,
         **kwargs
@@ -1382,6 +1383,8 @@ class DataCube(
             The selected scan positions
         colors : color or length N list/tuple of colors or None
             A color identifying each pattern
+        data : None or 2d array
+            image to overlay if show is True
         show : bool
             If True, show the patterns
         **kwargs
@@ -1411,7 +1414,7 @@ class DataCube(
             fig,axs = self.show_selected_patterns(returnfig=True, **kwargs)
             hsize = fig.bbox_inches.bounds[2]
             fsize = (hsize, hsize*self.Rshape[1]/self.Rshape[0])
-            self.show_selected_positions(figsize=fsize)
+            self.show_selected_positions(overlay_image=data, figsize=fsize)
 
 
     def show_selected_patterns(
@@ -1533,15 +1536,17 @@ class DataCube(
             Additional visualization arguments to pass to show
         """
         # Update visualization defaults
-        if overlay_image is not None:
-            self.visualization_defaults.image = overlay_image
+        if overlay_image is None:
+            try:
+                im = self.visualization_defaults.image
+            except AttributeError:
+                raise Exception("No default overlay image found; try passing `overlay_image`")
+                self.visualization_defaults.image = overlay_image
+        else:
+            im = overlay_image
         if overlay_box_linewidth is not None:
             self.visualization_defaults.box_lw = overlay_box_linewidth
         # Validate inputs
-        try:
-            im = self.visualization_defaults.image
-        except AttributeError:
-            raise Exception("No default overlay image found; try passing `overlay_image`")
         try:
             box_lw = self.visualization_defaults.box_lw
         except AttributeError:

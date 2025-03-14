@@ -1353,6 +1353,41 @@ class VoronoiClustering(object):
         else:
             plt.show()
 
+
+    def show_DP_channel(self,pos,thresh_bragg=0.5,colorA='r',colorB='y',markersize=50,
+        figwidth=8,vp={},imp={},returnfig=False):
+        """ Display a single class BP channels.
+
+        Parameters
+        ----------
+        pos : (int,int)
+            (rx,ry) position to display
+        markersize : number
+            size of the BP markers
+        show_current : bool
+            toggle displaying current vs. next state
+        """
+        # set up plot
+        aspect_ratio = self.Q_Ny/self.Q_Nx
+        fig,ax = plt.subplots(figsize=(figwidth,figwidth*aspect_ratio))
+        # get peaks
+        r = pos[0]*self.R_Ny + pos[1]
+        BPs = self.X[:,r]
+        bps = BPs>thresh_bragg
+        show(self.bvm.data,figax=(fig,ax),**vp)
+        ax.scatter(self._qy,self._qx,edgecolor=colorA,facecolor='none',
+            s=markersize,)
+        ax.scatter(self._qy[bps],self._qx[bps],color=colorB,
+            s=markersize,)
+        # grid off
+        ax.grid(False)
+        # exit
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+
     def show_clustering_selected(self, indices, thresh=0.3, cmap='hsv', show_current=True,
         scalesize=4,figsize=(8,8),returnfig=True):
         """ Display class image overlays in N_c plots, adding classes one by one in

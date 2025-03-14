@@ -1369,6 +1369,7 @@ def show_points(
     alpha=1,
     pointcolor="r",
     open_circles=False,
+    edgewidth=None,
     title=None,
     returnfig=False,
     **kwargs,
@@ -1403,6 +1404,7 @@ def show_points(
         "pointcolor": pointcolor,
         "alpha": alpha,
         "open_circles": open_circles,
+        "edgewidth":edgewidth,
     }
     add_points(ax, d)
 

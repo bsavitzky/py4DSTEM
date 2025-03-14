@@ -464,6 +464,8 @@ def add_points(ax, d):
     # open_circles
     open_circles = d["open_circles"] if "open_circles" in d.keys() else False
     assert isinstance(open_circles, bool)
+    edgewidth = 1 if d['edgewidth'] is None else d['edgewidth']
+    del(d['edgewidth'])
     # additional parameters
     kws = [
         k
@@ -477,7 +479,7 @@ def add_points(ax, d):
     # add the points
     if open_circles:
         ax.scatter(
-            y, x, s=scale, edgecolor=color, facecolor="none", alpha=alpha, **kwargs
+            y, x, s=scale, edgecolor=color, facecolor="none", alpha=alpha, linewidth=edgewidth, **kwargs
         )
     else:
         ax.scatter(y, x, s=s * scale / np.max(s), color=color, alpha=alpha, **kwargs)
