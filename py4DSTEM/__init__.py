@@ -20,6 +20,7 @@ from py4DSTEM.datacube import DataCube,VirtualImage,VirtualDiffraction
 from py4DSTEM.datacube.diskdetection import Probe
 from py4DSTEM.braggvectors import BraggVectors, BraggVectorMap
 from py4DSTEM.clustering import ACCHOO, VoronoiClustering
+from py4DSTEM.amorphous import AmorphousImager
 from py4DSTEM.diffraction import Crystal, Orientation
 from py4DSTEM.process import phase
 from py4DSTEM.process.polar import PolarDatacube

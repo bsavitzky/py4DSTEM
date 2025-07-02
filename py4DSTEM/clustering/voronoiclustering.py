@@ -13,6 +13,7 @@ from scipy.ndimage import gaussian_filter
 from scipy.ndimage import (gaussian_filter,binary_opening,binary_closing,
     binary_dilation,binary_erosion,)
 from py4DSTEM.braggvectors import BraggVectors
+from py4DSTEM.datacube import DataCube
 from py4DSTEM.utils import get_maxima_2D, get_voronoi_vertices
 from py4DSTEM.visualize import show, show_points
 
@@ -42,35 +43,1326 @@ class VoronoiClustering(object):
     >>> ...
     """
     # initialize
-    def __init__(self, braggvectors, upsample=1, X_is_boolean=True, max_dist=None, verbose=True):
+    def __init__(self, braggvectors, datacube=None, X_is_boolean=True, upsample=1,
+        max_dist=None, verbose=True, random_state=None):
         """
         Parameters
         ----------
         braggvectors : BraggVectors
-        upsample : integer
-            upsample factor for the Bragg vector histogram
+        datacube : Datacube or None
+            required to use the .get_class_mean_diffraction method
         X_is_boolean : bool
             treat braggvectors as booleans, ignoring intensities
+        upsample : integer
+            upsample factor for the Bragg vector histogram
         max_dist : None or number
             maximum allowable distance from a voronoi region seed for
             a peak to be included in that region
+        verbose : bool
+            toggle verbosity
+        random_state : int or RandomState instance or None
+            sets random number generator seed for NMF algo
         """
-        assert isinstance(
-            braggvectors, BraggVectors
-        ), "braggvectors must be a BraggVectors instance"
+        # setup parameters
         self._setup_braggvectors(braggvectors,upsample)
+        self._setup_datacube(datacube)
         self._X_is_boolean = X_is_boolean
         self.max_dist = max_dist
         self._v = verbose
+        self._random_state = random_state
+        # setup vis defaults
+        self._reset_visualization_defaults()
         return
 
     def _setup_braggvectors(self, braggvectors, upsample=1):
+        # input validation
+        assert isinstance(
+            braggvectors, BraggVectors
+        ), "braggvectors must be a BraggVectors instance"
+        # setup
         self.b = self.braggvectors = braggvectors
         self.upsample = upsample
         self.bvm = self.b.histogram(sampling=upsample)
 
+    def _setup_datacube(self, datacube):
+        # input validation
+        assert isinstance(
+            datacube, (DataCube,None)
+        ), "datacube must be a DataCube or None"
+        self._datacube = datacube
+
+    ##### Visualization #####
+
+    ## Visualization parameter handling ##
+
+    def _reset_visualization_defaults(self):
+        self._reset_vis_params_voronoi()
+        self._reset_vis_params_images()
+        self._reset_vis_params_channels()
+        self._reset_vis_params_diffraction()
+        self._reset_vis_params_class_grids()
+        self._reset_vis_params_clustering()
+        pass
+    def _reset_vis_params_voronoi(self):
+        self.vis_params_voronoi = {
+            'intensity_range' :'absolute',
+            'vmin' : 0,
+            'vmax'  : 5e-3,
+            'figsize' : (8,8),
+            'cmap':'jet',
+            'pointcolor':'#a8f7e4'
+        }
+        pass
+    def _reset_vis_params_images(self):
+        self.vis_params_images = {
+            'intensity_range' : 'absolute',
+            'vmin' : 0,
+            'vmax' : 1,
+            'cmap' : 'hot'
+        }
+        pass
+    def _reset_vis_params_channels(self):
+        self.vis_params_channels = {
+            'intensity_range' : 'absolute',
+            'vmin' : 0,
+            'vmax' : 5e-3,
+            'cmap' : 'gray',
+            'thresh_bragg' : 0.5,
+            'colorA' : 'r',
+            'colorB' : '#f0fa96',
+            'markersize' : 75,
+        }
+        pass
+    def _reset_vis_params_diffraction(self):
+        self.vis_params_diffraction = {
+            'intensity_range' : 'ordered',
+            'vmin' : 0.02,
+            'vmax' : 0.98,
+            'cmap' : 'grey'
+        }
+        pass
+    def _reset_vis_params_class_grids(self):
+        self.vis_params_class_grids = {
+            'ncols' : 4,
+            'stride' : 1,
+            'figwidth' : 4,
+            'label' : True,
+            'labeloffset' : 5,
+            'labelsize' : 24,
+            'labelcolor' : 'w',
+        }
+    def _reset_vis_params_clustering(self):
+        self.vis_params_clustering = {
+            'thresh' : 0.18,
+            'cmap' : 'hsv',
+            'figwidth' : 4,
+        }
+        pass
+
+    def _get_vis_params_voronoi(self, vps):
+        return self.vis_params_voronoi | vps
+    def _update_vis_params_voronoi_defaults(self, vps):
+        self.vis_params_voronoi = self._get_vis_params_voronoi(vps)
+        pass
+
+    def _get_vis_params_images(self, vps):
+        return self.vis_params_images | vps
+    def _update_vis_params_images_defaults(self, vps):
+        self.vis_params_images = self._get_vis_params_images(vps)
+        pass
+
+    def _get_vis_params_channels(self, vps):
+        return self.vis_params_channels | vps
+    def _update_vis_params_channels_defaults(self, vps):
+        self.vis_params_channels = self._get_vis_params_channels(vps)
+        pass
+
+    def _get_vis_params_diffraction(self, vps):
+        return self.vis_params_diffraction | vps
+    def _update_vis_params_diffraction_defaults(self, vps):
+        self.vis_params_diffraction = self._get_vis_params_diffraction(vps)
+        pass
+
+    def _get_vis_params_class_grids(
+        self,
+        ncols=None,
+        label=None,
+        labeloffset=None,
+        labelsize=None,
+        labelcolor=None,
+        stride=None,
+        figwidth=None
+        ):
+        new_params = {}
+        if ncols is not None: new_params['ncols'] = ncols
+        if label is not None: new_params['label'] = label
+        if labeloffset is not None: new_params['labeloffset'] = labeloffset
+        if labelsize is not None: new_params['labelsize'] = labelsize
+        if labelcolor is not None: new_params['labelcolor'] = labelcolor
+        if stride is not None: new_params['stride'] = stride
+        if figwidth is not None: new_params['figwidth'] = figwidth
+        return self.vis_params_class_grids | new_params
+    def _update_vis_params_class_grids_defaults(
+        self,
+        ncols=None,
+        label=None,
+        labeloffset=None,
+        labelsize=None,
+        labelcolor=None,
+        stride=None,
+        figwidth=None
+        ):
+        self.vis_params_class_grids = self._get_vis_params_class_grids(
+            ncols=ncols,
+            label=label,
+            labeloffset=labeloffset,
+            labelsize=labelsize,
+            labelcolor=labelcolor,
+            stride=stride,
+            figwidth=figwidth
+        )
+        pass
+
+    def _get_vis_params_clustering(
+        self,
+        thresh=None,
+        cmap=None,
+        figwidth=None
+    ):
+        new_params = {}
+        if thresh is not None: new_params['thresh'] = thresh
+        if cmap is not None: new_params['cmap'] = cmap
+        if figwidth is not None: new_params['figwidth'] = figwidth
+        return self.vis_params_clustering | new_params
+    def _update_vis_params_clustering_defaults(
+        self,
+        thresh=None,
+        cmap=None,
+        figwidth=None,
+    ):
+        self.vis_params_clustering = self._get_vis_params_clustering(
+            thresh=thresh,
+            cmap=cmap,
+            figwidth=figwidth
+        )
+        pass
+
+
+    ### Visualization methods ###
+
+    ## Show voronoi partitioning ##
+
+    def show_bvm(self,returnfig=False,update_vps=False,**vps):
+        """
+        Show the bragg vector maxima.
+
+        Parameters
+        ----------
+        returnfig : bool
+            toggle returning the figure
+        vp : dict
+            parameter dict to pass to show when visualizing the results
+        """
+        if update_vps:
+            self._update_vis_params_voronoi_defaults(vps)
+            vis_params = self.vis_params_voronoi.copy()
+        else:
+            vis_params = self._get_vis_params_voronoi(vps).copy()
+        vis_params.pop('pointcolor')
+        fig,ax = show(
+            self.bvm,
+            returnfig=True,
+            **vis_params
+        )
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+    def show_kpoints(self,returnfig=False,update_vps=False,**vps):
+        """
+        Show the bragg vector maxima.
+
+        Parameters
+        ----------
+        returnfig : bool
+            toggle returning the figure
+        vp : dict
+            parameter dict to pass to show when visualizing the results
+        """
+        if update_vps:
+            self._update_vis_params_voronoi_defaults(vps)
+            vis_params = self.vis_params_voronoi
+        else:
+            vis_params = self._get_vis_params_voronoi(vps)
+        fig,ax = show_points(
+            self.bvm,
+            x=self._qx,
+            y=self._qy,
+            open_circles=True,
+            returnfig=True,
+            **vis_params
+        )
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+    def show_voronoi(self,c='lightcyan',lw=0.5,returnfig=False,update_vps=False,**vps):
+        if update_vps:
+            self._update_vis_params_voronoi_defaults(vps)
+            vis_params = self.vis_params_voronoi
+        else:
+            vis_params = self._get_vis_params_voronoi(vps)
+        # Show
+        fig,ax = show_points(
+            self.bvm,
+            x=self._qx,
+            y=self._qy,
+            open_circles=True,
+            returnfig=True,
+            **vis_params
+        )
+        for region in range(len(self._voronoi_vertices)):
+            vertices_curr = self._voronoi_vertices[region]
+            if vertices_curr is not None:
+                for i in range(len(vertices_curr)):
+                    x0,y0 = vertices_curr[i,:]
+                    x1,y1 = vertices_curr[(i+1)%len(vertices_curr),:]
+                    ax.plot((y0,y1),(x0,x1),c,lw=lw)
+        ax.set_xlim([0,self.bvm.data.shape[1]])
+        ax.set_ylim([0,self.bvm.data.shape[0]])
+        plt.gca().invert_yaxis()
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+
+    ## Show classes ##
+
+    def show_class_image(self,index,figwidth=4,show_next=False,
+        returnfig=False, update_vps=True, **vps):
+        """ Display a single class image.
+
+        Parameters
+        ----------
+        index : int
+            class to display
+        show_next : bool
+            toggle displaying current vs. next state
+        figwidth : number
+            the figure width; height is autoscaled
+        """
+        # get vis params
+        if update_vps:
+            self._update_vis_params_images_defaults(vps)
+            vis_params = self.vis_params_images
+        else:
+            vis_params = self._get_vis_params_images(vps)
+        # set up plot
+        aspect_ratio = self.R_Ny/self.R_Nx
+        fig,ax = plt.subplots(figsize=(figwidth,figwidth/aspect_ratio))
+        # get the classes
+        if show_next:
+            class_image = self.get_candidate_class_image(index)
+        else:
+            class_image = self.get_class_image(index)
+        # show the image
+        show(class_image,figax=(fig,ax),**vis_params)
+        # grid off
+        ax.grid(False)
+        # exit
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+    def show_class_channels(self,index,thresh_bragg=None,colorA=None,colorB=None,
+        markersize=None,figwidth=4,returnfig=False,show_next=False,
+        update_vps=True,**vps):
+        """ Display a single class BP channels.
+
+        Parameters
+        ----------
+        index : int
+            class to display
+        markersize : number
+            size of the BP markers
+        show_next : bool
+            toggle displaying current vs. next state
+        """
+        # get vis params
+        if thresh_bragg is not None: vps['thresh_bragg']=thresh_bragg
+        if colorA is not None: vps['colorA']=colorA
+        if colorB is not None: vps['colorB']=colorB
+        if markersize is not None: vps['markersize']=markersize
+        if update_vps:
+            self._update_vis_params_channels_defaults(vps)
+            vis_params = self.vis_params_channels.copy()
+        else:
+            vis_params = self._get_vis_params_channels(vps).copy()
+        thresh_bragg = vis_params.pop('thresh_bragg')
+        colorA = vis_params.pop('colorA')
+        colorB = vis_params.pop('colorB')
+        markersize = vis_params.pop('markersize')
+        # set up plot
+        aspect_ratio = self.Q_Ny/self.Q_Nx
+        fig,ax = plt.subplots(figsize=(figwidth,figwidth*aspect_ratio))
+        # get the classes
+        if show_next:
+            class_BPs = self.get_candidate_class_BPs(index)
+        else:
+            class_BPs = self.get_class_BPs(index)
+        bps = class_BPs>thresh_bragg
+        show(self.bvm.data,figax=(fig,ax),**vis_params)
+        ax.scatter(self._qy,self._qx,edgecolor=colorA,facecolor='none',
+            s=markersize,)
+        ax.scatter(self._qy[bps],self._qx[bps],color=colorB,
+            s=markersize,)
+        # grid off
+        ax.grid(False)
+        # exit
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+    def show_class_diffraction(self,index,figwidth=4,show_next=False,
+        returnfig=False, update_vps=True, thresh=0.25, shift_center=True,
+        subpixel=False, overwrite=False, verbose=True, **vps):
+        """ Display a single class mean diffraction pattern. If the mean
+        diffraction pattern hasn't been found yet, compute it.
+
+        Parameters
+        ----------
+        index : int
+            class to display
+        show_next : bool
+            toggle displaying current vs. next state
+        figwidth : number
+            the figure width; height is autoscaled
+        thresh : number
+            If the mean pattern needs to be computed, only include image pixels
+            with intensities above this value
+        shift_center : bool
+            If the mean pattern needs to be computed, toggle shifting the centers
+            for descan correction
+        subpixel : bool
+            If the mean pattern needs to be computed, toggle subpixel center shifts
+        get_next : bool
+            If the mean pattern needs to be computed, if True, compute candidate
+            (rather than current) class diffraction
+        overwrite : bool
+            If set to True, re-compute the mean pattern if this mean has already
+            been computed.
+        verbose : bool
+            Toggle verbosity
+        """
+        # Get the mean diffraction pattern
+        if not show_next:
+            dp = self.get_class_mean_diffraction(
+                index,
+                thresh=thresh,
+                shift_center=shift_center,
+                subpixel=subpixel,
+                overwrite=overwrite,
+                verbose=verbose
+            )
+        else:
+            dp = self.get_candidate_class_mean_diffraction(
+                index,
+                thresh=thresh,
+                shift_center=shift_center,
+                subpixel=subpixel,
+                overwrite=overwrite,
+                verbose=verbose
+            )
+        # get vis params
+        if update_vps:
+            self._update_vis_params_diffraction_defaults(vps)
+            vis_params = self.vis_params_diffraction
+        else:
+            vis_params = self._get_vis_params_diffraction(vps)
+        # set up plot
+        aspect_ratio = self.R_Ny/self.R_Nx
+        fig,ax = plt.subplots(figsize=(figwidth,figwidth/aspect_ratio))
+        # show the image
+        show(dp,figax=(fig,ax),**vis_params)
+        # grid off
+        ax.grid(False)
+        # exit
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+    def show_class(self,index,thresh_bragg=None,colorA=None,colorB=None,
+        markersize=None,vps_ims={},vps_channels={},vps_diff={},figwidth=8,
+        show_next=False,update_vps=True,show_diffraction=False,get_diffp={},
+        returnfig=False):
+        """ Display a single class image and BP channels.
+
+        Parameters
+        ----------
+        index : int
+            class to display
+        markersize : number
+            size of the BP markers
+        show_next : bool
+            toggle displaying current vs. next state
+        """
+        # get vis params (images)
+        if update_vps:
+            self._update_vis_params_images_defaults(vps_ims)
+            vis_params_ims = self.vis_params_images
+        else:
+            vis_params_ims = self._get_vis_params_images(vps_ims)
+        # get vis params (channels)
+        if thresh_bragg is not None: vps_channels['thresh_bragg']=thresh_bragg
+        if colorA is not None: vps_channels['colorA']=colorA
+        if colorB is not None: vps_channels['colorB']=colorB
+        if markersize is not None: vps_channels['markersize']=markersize
+        if update_vps:
+            self._update_vis_params_channels_defaults(vps_channels)
+            vis_params_channels = self.vis_params_channels.copy()
+        else:
+            vis_params_channels = self._get_vis_params_channels(vps_channels).copy()
+        thresh_bragg = vis_params_channels.pop('thresh_bragg')
+        colorA = vis_params_channels.pop('colorA')
+        colorB = vis_params_channels.pop('colorB')
+        markersize = vis_params_channels.pop('markersize')
+        # get vis params (diffraction)
+        if show_diffraction:
+            if update_vps:
+                self._update_vis_params_diffraction_defaults(vps_diff)
+                vis_params_diff = self.vis_params_diffraction
+            else:
+                vis_params_diff = self._get_vis_params_images(vps_diff)
+
+        # set up plot
+        aspect_ratio1 = self.R_Ny/self.R_Nx
+        aspect_ratio2 = self.Q_Ny/self.Q_Nx
+        aspect_ratio = aspect_ratio1+aspect_ratio2
+        if show_diffraction:
+            aspect_ratio += aspect_ratio2
+            figwidth *= 1.5
+            fig,axs = plt.subplots(1,3,figsize=(figwidth,figwidth/aspect_ratio))
+            ax1,ax2,ax3 = axs
+        else:
+            fig,axs = plt.subplots(1,2,figsize=(figwidth,figwidth/aspect_ratio))
+            ax1,ax2 = axs
+        # get the classes
+        if show_next:
+            class_BPs, class_image = self.get_candidate_class(index)
+            if show_diffraction:
+                class_dp = self.get_class_mean_diffraction(index, get_next=True, **get_diffp)
+        else:
+            class_BPs, class_image = self.get_class(index)
+            if show_diffraction:
+                class_dp = self.get_class_mean_diffraction(index, get_next=False, **get_diffp)
+        # show the image
+        show(class_image,figax=(fig,ax1),**vis_params_ims)
+        # show the channels
+        bps = class_BPs>thresh_bragg
+        show(self.bvm.data,figax=(fig,ax2),**vis_params_channels)
+        ax2.scatter(self._qy,self._qx,edgecolor=colorA,facecolor='none',
+            s=markersize,)
+        ax2.scatter(self._qy[bps],self._qx[bps],color=colorB,
+            s=markersize,)
+        # show diffraction
+        if show_diffraction:
+            show(class_dp,figax=(fig,ax3),**vis_params_diff)
+            ax3.grid(False)
+        # grid off
+        ax1.grid(False)
+        ax2.grid(False)
+        # exit
+        if returnfig:
+            return fig,axs
+        else:
+            plt.show()
+
+    def show_classes_images(self,ncols=None,label=None,labeloffset=None,
+        labelsize=None,labelcolor=None,stride=None,figwidth=None,show_next=False,
+        returnfig=False,update_vps=True,**vps):
+        """
+        """
+        # validate inputs
+        if show_next:
+            assert(not(self.W_next is None or self.H_next is None or self.N_c_next is  None)), "Next state is not set!"
+        # get vis params (images)
+        if update_vps:
+            self._update_vis_params_images_defaults(vps)
+            vis_params_ims = self.vis_params_images
+        else:
+            vis_params_ims = self._get_vis_params_images(vps)
+        # get vis params (grid)
+        vps_grid = {}
+        if ncols is not None: vps_grid['ncols'] = ncols
+        if label is not None: vps_grid['label'] = label
+        if labeloffset is not None: vps_grid['labeloffset'] = labeloffset
+        if labelsize is not None: vps_grid['labelsize'] = labelsize
+        if labelcolor is not None: vps_grid['labelcolor'] = labelcolor
+        if stride is not None: vps_grid['stride'] = stride
+        if figwidth is not None: vps_grid['figwidth'] = figwidth
+        if update_vps:
+            self._update_vis_params_class_grids_defaults(**vps_grid)
+            vis_params_grid = self.vis_params_class_grids
+        else:
+            vis_params_grid = self._get_vis_params_class_grids(vps_grid)
+        ncols = vis_params_grid['ncols']
+        label = vis_params_grid['label']
+        labeloffset = vis_params_grid['labeloffset']
+        labelsize = vis_params_grid['labelsize']
+        labelcolor = vis_params_grid['labelcolor']
+        stride = vis_params_grid['stride']
+        figwidth = vis_params_grid['figwidth']
+        # get number of classes
+        if show_next:
+            N_c = self.N_c_next
+        else:
+            N_c = self.N_c
+        # set up plot
+        N_classes = N_c // stride
+        nrows = int(np.ceil((N_classes)/ncols))
+        aspect_ratio = self.R_Ny/self.R_Nx
+        fig,axs = plt.subplots(nrows,ncols,figsize=(figwidth*ncols,figwidth*nrows/aspect_ratio))
+        # loop over classes, get axes
+        for index in range(N_classes):
+            ax = axs[int(index//ncols),int(index%ncols)]
+            # get the classes
+            if show_next:
+                class_image = self.get_candidate_class_image(index*stride)
+            else:
+                class_image = self.get_class_image(index*stride)
+            # show the images
+            show(class_image,figax=(fig,ax),**vis_params_ims)
+            # add label
+            if label:
+                ax.text(labeloffset,labeloffset,"{}".format(index*stride),size=labelsize,color=labelcolor,ha='left',va='top')
+            # grid off
+            ax.grid(False)
+        # remove extra axes
+        for index in range(N_classes,nrows*ncols):
+            ax = axs[int(index//ncols),int(index%ncols)]
+            ax.axis('off')
+        # exit
+        if returnfig:
+            return fig,axs
+        else:
+            plt.show()
+
+    def show_classes_channels(self,thresh_bragg=None,colorA=None,colorB=None,
+        markersize=None,ncols=None,label=None,labeloffset=None,labelsize=None,
+        labelcolor=None,stride=None,figwidth=None,show_next=False,update_vps=True,
+        returnfig=False,**vps):
+        """
+        """
+        # get vis params (channels)
+        if thresh_bragg is not None: vps['thresh_bragg']=thresh_bragg
+        if colorA is not None: vps['colorA']=colorA
+        if colorB is not None: vps['colorB']=colorB
+        if markersize is not None: vps['markersize']=markersize
+        if update_vps:
+            self._update_vis_params_channels_defaults(vps)
+            vis_params_channels = self.vis_params_channels.copy()
+        else:
+            vis_params_channels = self._get_vis_params_channels(vps).copy()
+        thresh_bragg = vis_params_channels.pop('thresh_bragg')
+        colorA = vis_params_channels.pop('colorA')
+        colorB = vis_params_channels.pop('colorB')
+        markersize = vis_params_channels.pop('markersize')
+        # get vis params (grid)
+        vps_grid = {}
+        if ncols is not None: vps_grid['ncols'] = ncols
+        if label is not None: vps_grid['label'] = label
+        if labeloffset is not None: vps_grid['labeloffset'] = labeloffset
+        if labelsize is not None: vps_grid['labelsize'] = labelsize
+        if labelcolor is not None: vps_grid['labelcolor'] = labelcolor
+        if stride is not None: vps_grid['stride'] = stride
+        if figwidth is not None: vps_grid['figwidth'] = figwidth
+        if update_vps:
+            self._update_vis_params_class_grids_defaults(**vps_grid)
+            vis_params_grid = self.vis_params_class_grids
+        else:
+            vis_params_grid = self._get_vis_params_class_grids(vps_grid)
+        ncols = vis_params_grid['ncols']
+        label = vis_params_grid['label']
+        labeloffset = vis_params_grid['labeloffset']
+        labelsize = vis_params_grid['labelsize']
+        labelcolor = vis_params_grid['labelcolor']
+        stride = vis_params_grid['stride']
+        figwidth = vis_params_grid['figwidth']
+        # get number of classes
+        if show_next:
+            N_c = self.N_c_next
+        else:
+            N_c = self.N_c
+        # set up plot
+        N_classes = N_c // stride
+        nrows = int(np.ceil((N_classes)/ncols))
+        aspect_ratio = self.Q_Ny/self.Q_Nx
+        fig,axs = plt.subplots(nrows,ncols,figsize=(figwidth*ncols,figwidth*nrows/aspect_ratio))
+        # loop over classes, get axes
+        for index in range(N_classes):
+            ax = axs[int(index//ncols),int(index%ncols)]
+            # get the classes
+            if show_next:
+                class_BPs = self.get_candidate_class_BPs(index*stride)
+            else:
+                class_BPs = self.get_class_BPs(index*stride)
+            # show the class peaks
+            bps = class_BPs>thresh_bragg
+            show(self.bvm.data,figax=(fig,ax),**vis_params_channels)
+            ax.scatter(self._qy,self._qx,edgecolor=colorA,facecolor='none',
+                s=markersize,)
+            ax.scatter(self._qy[bps],self._qx[bps],color=colorB,
+                s=markersize,)
+            # add label
+            if label:
+                ax.text(labeloffset,labeloffset,"{}".format(index*stride),size=labelsize,color=labelcolor,ha='left',va='top')
+            # grid off
+            ax.grid(False)
+        # remove extra axes
+        for index in range(N_classes,nrows*ncols):
+            ax = axs[int(index//ncols),int(index%ncols)]
+            ax.axis('off')
+        # exit
+        if returnfig:
+            return fig,axs
+        else:
+            plt.show()
+
+    def show_classes_diffraction(self,ncols=None,label=None,labeloffset=None,
+        labelsize=None,labelcolor=None,stride=None,figwidth=None,show_next=False,
+        returnfig=False,update_vps=True,get_diffp={},**vps):
+        """
+        """
+        # get vis params (diffraction)
+        if update_vps:
+            self._update_vis_params_diffraction_defaults(vps)
+            vis_params_diff = self.vis_params_diffraction
+        else:
+            vis_params_diff = self._get_vis_params_diffraction(vps)
+        # get vis params (grid)
+        vps_grid = {}
+        if ncols is not None: vps_grid['ncols'] = ncols
+        if label is not None: vps_grid['label'] = label
+        if labeloffset is not None: vps_grid['labeloffset'] = labeloffset
+        if labelsize is not None: vps_grid['labelsize'] = labelsize
+        if labelcolor is not None: vps_grid['labelcolor'] = labelcolor
+        if stride is not None: vps_grid['stride'] = stride
+        if figwidth is not None: vps_grid['figwidth'] = figwidth
+        if update_vps:
+            self._update_vis_params_class_grids_defaults(**vps_grid)
+            vis_params_grid = self.vis_params_class_grids
+        else:
+            vis_params_grid = self._get_vis_params_class_grids(vps_grid)
+        ncols = vis_params_grid['ncols']
+        label = vis_params_grid['label']
+        labeloffset = vis_params_grid['labeloffset']
+        labelsize = vis_params_grid['labelsize']
+        labelcolor = vis_params_grid['labelcolor']
+        stride = vis_params_grid['stride']
+        figwidth = vis_params_grid['figwidth']
+        # get number of classes
+        if show_next:
+            N_c = self.N_c_next
+        else:
+            N_c = self.N_c
+        # set up plot
+        N_classes = N_c // stride
+        nrows = int(np.ceil((N_classes)/ncols))
+        aspect_ratio = self.Q_Ny/self.Q_Nx
+        fig,axs = plt.subplots(nrows,ncols,figsize=(figwidth*ncols,figwidth*nrows/aspect_ratio))
+        # loop over classes, get axes
+        for index in range(N_classes):
+            ax = axs[int(index//ncols),int(index%ncols)]
+            # get the classes
+            if show_next:
+                class_dp = self.get_class_mean_diffraction(index*stride, get_next=True, **get_diffp)
+            else:
+                class_dp = self.get_class_mean_diffraction(index*stride, **get_diffp)
+            # show the diffraction
+            show(class_dp,figax=(fig,ax),**vis_params_diff)
+            # add label
+            if label:
+                ax.text(labeloffset,labeloffset,"{}".format(index*stride),size=labelsize,color=labelcolor,ha='left',va='top')
+            # grid off
+            ax.grid(False)
+        # remove extra axes
+        for index in range(N_classes,nrows*ncols):
+            ax = axs[int(index//ncols),int(index%ncols)]
+            ax.axis('off')
+        # exit
+        if returnfig:
+            return fig,axs
+        else:
+            plt.show()
+
+    def show_classes(self,thresh_bragg=None,colorA=None,colorB=None,markersize=None,
+        ncols=None,label=None,labeloffset=None,labelsize=None,labelcolor=None,
+        stride=None,figwidth=None,vps_channels={},vps_ims={},show_next=False,
+        returnfig=False,update_vps=True):
+        """
+        """
+        # get vis params (images)
+        if update_vps:
+            self._update_vis_params_images_defaults(vps_ims)
+            vis_params_ims = self.vis_params_images
+        else:
+            vis_params_ims = self._get_vis_params_images(vps_ims)
+        # get vis params (channels)
+        if thresh_bragg is not None: vps_channels['thresh_bragg']=thresh_bragg
+        if colorA is not None: vps_channels['colorA']=colorA
+        if colorB is not None: vps_channels['colorB']=colorB
+        if markersize is not None: vps_channels['markersize']=markersize
+        if update_vps:
+            self._update_vis_params_channels_defaults(vps_channels)
+            vis_params_channels = self.vis_params_channels.copy()
+        else:
+            vis_params_channels = self._get_vis_params_channels(vps_channels).copy()
+        thresh_bragg = vis_params_channels.pop('thresh_bragg')
+        colorA = vis_params_channels.pop('colorA')
+        colorB = vis_params_channels.pop('colorB')
+        markersize = vis_params_channels.pop('markersize')
+        # get vis params (grid)
+        vps_grid = {}
+        if ncols is not None: vps_grid['ncols'] = ncols
+        if label is not None: vps_grid['label'] = label
+        if labeloffset is not None: vps_grid['labeloffset'] = labeloffset
+        if labelsize is not None: vps_grid['labelsize'] = labelsize
+        if labelcolor is not None: vps_grid['labelcolor'] = labelcolor
+        if stride is not None: vps_grid['stride'] = stride
+        if figwidth is not None: vps_grid['figwidth'] = figwidth
+        if update_vps:
+            self._update_vis_params_class_grids_defaults(**vps_grid)
+            vis_params_grid = self.vis_params_class_grids
+        else:
+            vis_params_grid = self._get_vis_params_class_grids(vps_grid)
+        ncols = vis_params_grid['ncols']
+        label = vis_params_grid['label']
+        labeloffset = vis_params_grid['labeloffset']*1.5
+        labelsize = vis_params_grid['labelsize']*1.5
+        labelcolor = vis_params_grid['labelcolor']
+        stride = vis_params_grid['stride']
+        figwidth = vis_params_grid['figwidth']*2
+        # get number of classes
+        if show_next:
+            N_c = self.N_c_next
+        else:
+            N_c = self.N_c
+        # set up plot
+        N_classes = N_c // stride
+        nrows = int(np.ceil((N_classes)/ncols))
+        aspect_ratio1 = self.R_Ny/self.R_Nx
+        aspect_ratio2 = self.Q_Ny/self.Q_Nx
+        aspect_ratio = aspect_ratio1+aspect_ratio2
+        fig,axs = plt.subplots(nrows,2*ncols,figsize=(figwidth*ncols,figwidth*nrows/aspect_ratio))
+        # loop over classes, get axes
+        for index in range(N_classes):
+            ax1 = axs[int(index//ncols),int(2*(index%ncols))]
+            ax2 = axs[int(index//ncols),int(2*(index%ncols)+1)]
+            # get the classes
+            if show_next:
+                class_BPs, class_image = self.get_candidate_class(index*stride)
+            else:
+                class_BPs, class_image = self.get_class(index*stride)
+            # show the images
+            show(class_image,figax=(fig,ax1),**vis_params_ims)
+            # show the channels
+            bps = class_BPs>thresh_bragg
+            show(self.bvm.data,figax=(fig,ax2),**vis_params_channels)
+            ax2.scatter(self._qy,self._qx,edgecolor=colorA,facecolor='none',
+                s=markersize,)
+            ax2.scatter(self._qy[bps],self._qx[bps],color=colorB,
+                s=markersize,)
+            # add label
+            if label:
+                ax1.text(labeloffset,labeloffset,"{}".format(index*stride),size=labelsize,color=labelcolor,ha='left',va='top')
+            # grid off
+            ax1.grid(False)
+            ax2.grid(False)
+        # remove extra axes
+        for index in range(N_classes,nrows*ncols):
+            ax1 = axs[int(index//ncols),int(2*(index%ncols))]
+            ax2 = axs[int(index//ncols),int(2*(index%ncols))+1]
+            ax1.axis('off')
+            ax2.axis('off')
+        # exit
+        if returnfig:
+            return fig,axs
+        else:
+            plt.show()
+
+
+    ## Show clustering ##
+
+    def show_clustering(self,thresh=None,cmap=None,figwidth=None,update_vps=True,
+        show_next=False,returnfig=False):
+        """ Overlay of all class images.
+        """
+        if update_vps:
+            self._update_vis_params_clustering_defaults(
+                thresh=thresh,cmap=cmap,figwidth=figwidth,
+            )
+            vis_params = self.vis_params_clustering
+        else:
+            vis_params = self._get_vis_params_clustering(
+                thresh=thresh,cmap=cmap,figwidth=figwidth,
+            )
+        thresh = vis_params['thresh']
+        cmap = vis_params['cmap']
+        figwidth = vis_params['figwidth']
+        if show_next:
+            N_c = self.N_c_next
+        else:
+            N_c = self.N_c
+        cmap_base = get_cmap(cmap)
+        aspect_ratio = self.R_Ny/self.R_Nx
+        fig,ax = plt.subplots(figsize=(figwidth,figwidth/aspect_ratio))
+        ax.matshow(np.zeros((self.R_Nx,self.R_Ny)),cmap='gray')
+        for index in range(N_c):
+            if show_next:
+                class_image = self.get_candidate_class_image(index)
+            else:
+                class_image = self.get_class_image(index)
+
+            ma = np.ma.array(class_image, mask = class_image<thresh)
+            if not np.all(ma.mask):
+                colors = [(0,0,0,1),cmap_base(index/N_c)]
+                cm = LinearSegmentedColormap.from_list('cmap', colors, N=100)
+                ax.matshow(ma,cmap=cm)
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+    def show_clustering_selected(self, indices, thresh=None, cmap=None, figwidth=None,
+        update_vps=True,show_next=False,scalesize=4,figsize=(8,8),returnfig=False):
+        """ Display class image overlays in N_c plots, adding classes one by one in
+        each successive plot.
+
+        Parameters
+        ----------
+        indices : list of ints
+            classes to display
+        thresh : number
+            min display intensity
+        cmap : colormap
+        show_next : bool
+            toggles showing the current vs. next state
+        ncols : int
+            number of display columns
+        label : bool
+            toggles display of the class index
+        labeloffset : number
+            label offset from the plot corner
+        labelsize : number
+            label size
+        labelcolor : color
+        stride : int
+            display only every stride images
+        scalesize : number
+            scale the figure size
+        figsize : 2-tuple
+            figure size
+        returnfig : bool
+            toggle returning the figure
+        """
+        if update_vps:
+            self._update_vis_params_clustering_defaults(
+                thresh=thresh,cmap=cmap,figwidth=figwidth,
+            )
+            vis_params = self.vis_params_clustering
+        else:
+            vis_params = self._get_vis_params_clustering(
+                thresh=thresh,cmap=cmap,figwidth=figwidth,
+            )
+        thresh = vis_params['thresh']
+        cmap = vis_params['cmap']
+        figwidth = vis_params['figwidth']
+        if show_next:
+            N_c = self.N_c_next
+        else:
+            N_c = self.N_c
+        cmap_base = get_cmap(cmap)
+        fig,ax = plt.subplots(figsize=figsize)
+        ax.matshow(np.zeros((self.R_Nx,self.R_Ny)),cmap='gray')
+        for index in (indices):
+            if show_next:
+                class_image = self.get_candidate_class_image(index)
+            else:
+                class_image = self.get_class_image(index)
+
+            ma = np.ma.array(class_image, mask = class_image<thresh)
+            if not np.all(ma.mask):
+                colors = [(0,0,0,1),cmap_base(index/N_c)]
+                cm = LinearSegmentedColormap.from_list('cmap', colors, N=100)
+                ax.matshow(ma,cmap=cm)
+        # return
+        if returnfig:
+            return fig,ax
+        else:
+            plt.show()
+
+    def show_clustering_accum(self,thresh=None,cmap=None,ncols=None,label=None,
+        labeloffset=None,labelsize=None,labelcolor=None,stride=None,figwidth=None,
+        scalesize=4,show_next=False,update_vps=True,returnfig=False):
+        """ Display class image overlays in N_c plots, adding classes one by one in
+        each successive plot.
+
+        Parameters
+        ----------
+        thresh : number
+            min display intensity
+        cmap : colormap
+        show_next : bool
+            toggles showing the current vs. next state
+        ncols : int
+            number of display columns
+        label : bool
+            toggles display of the class index
+        labeloffset : number
+            label offset from the plot corner
+        labelsize : number
+            label size
+        labelcolor : color
+        stride : int
+            display only every stride images
+        scalesize : number
+            scale the figure size
+        """
+        # get vis params (clustering)
+        if update_vps:
+            self._update_vis_params_clustering_defaults(
+                thresh=thresh,cmap=cmap,
+            )
+            vis_params = self.vis_params_clustering
+        else:
+            vis_params = self._get_vis_params_clustering(
+                thresh=thresh,cmap=cmap,
+            )
+        thresh = vis_params['thresh']
+        cmap = vis_params['cmap']
+        # get vis params (grid)
+        vps_grid = {}
+        if ncols is not None: vps_grid['ncols'] = ncols
+        if label is not None: vps_grid['label'] = label
+        if labeloffset is not None: vps_grid['labeloffset'] = labeloffset
+        if labelsize is not None: vps_grid['labelsize'] = labelsize
+        if labelcolor is not None: vps_grid['labelcolor'] = labelcolor
+        if stride is not None: vps_grid['stride'] = stride
+        if figwidth is not None: vps_grid['figwidth'] = figwidth
+        if update_vps:
+            self._update_vis_params_class_grids_defaults(**vps_grid)
+            vis_params_grid = self.vis_params_class_grids
+        else:
+            vis_params_grid = self._get_vis_params_class_grids(vps_grid)
+        ncols = vis_params_grid['ncols']
+        label = vis_params_grid['label']
+        labeloffset = vis_params_grid['labeloffset']
+        labelsize = vis_params_grid['labelsize']
+        labelcolor = vis_params_grid['labelcolor']
+        stride = vis_params_grid['stride']
+        figwidth = vis_params_grid['figwidth']
+        if show_next:
+            N_c = self.N_c_next
+        else:
+            N_c = self.N_c
+        N_classes = N_c//stride
+        ncols = int(ncols)
+        nrows = int(np.ceil(N_classes/ncols))
+        cmap_base = get_cmap(cmap)
+        aspect_ratio = self.R_Ny/self.R_Nx
+        fig,axs = plt.subplots(nrows,ncols,
+            figsize=(scalesize*ncols,scalesize*nrows/aspect_ratio))
+        for i in range(N_classes):
+            if ncols==1:
+                ax = axs[i]
+            else:
+                ax = axs[i//ncols,i%ncols]
+            ax.matshow(np.zeros((self.R_Nx,self.R_Ny)),cmap='gray')
+            for index in np.arange(i*stride+1):
+                if show_next:
+                    class_image = self.get_candidate_class_image(index)
+                else:
+                    class_image = self.get_class_image(index)
+
+                ma = np.ma.array(class_image, mask = class_image<thresh)
+                if not np.all(ma.mask):
+                    colors = [(0,0,0,1),cmap_base(index/N_c)]
+                    cm = LinearSegmentedColormap.from_list('cmap', colors, N=100)
+                    ax.matshow(ma,cmap=cm)
+            if label:
+                ax.text(labeloffset,labeloffset+labelsize/2,"{}".format(index),size=labelsize,color=labelcolor)
+        # remove excess axes
+        for i in range(N_classes,ncols*nrows):
+            ax = axs[i//ncols,i%ncols]
+            ax.axis('off')
+        # return
+        if returnfig:
+            return fig,axs
+        else:
+            plt.show()
+
+
+    # ## Show channels & data comparisons ##
+
+    # def show_voronoi_mask(self,mask,mask_alpha=0.4,mask_color='y',
+    #     c='lightcyan',lw=0.5,vp={},returnfig=False):
+    #     """ mask is a list of integer (voronoi regions)
+    #     """
+    #     patches = []
+    #     fig,ax = self.show_voronoi(c=c,lw=lw,vp=vp,returnfig=True)
+    #     for idx in mask:
+    #         vertices_curr = self._voronoi_vertices[idx]
+    #         if vertices_curr is not None:
+    #             vert = np.roll(vertices_curr,-1,1)
+    #             patches.append(Polygon(vert))
+    #     p = PatchCollection(patches,alpha=mask_alpha,color=mask_color)
+    #     ax.add_collection(p)
+    #     if returnfig:
+    #         return fig,ax
+    #     else:
+    #         plt.show()
+
+    # def show_data_mask_compare(self,coord,mask_alpha=0.4,mask_color='y',
+    #     c='lightcyan',lw=0.5,marker='x',markercolor='blue',markersize=100,
+    #     vectors=False,vect_cmap='cool',vect_width=0.5,vect_headsize=6,vectp={},
+    #     vp={},verbose=False,returnfig=False):
+    #     """ show the data points, mask, voronoi, bvm overlaid
+    #     """
+    #     rx,ry = coord
+    #     mask = self.state_masks[rx][ry]
+    #     # show voronoi diagram
+    #     fig,ax = self.show_voronoi_mask(
+    #         mask = mask,
+    #         c = c,
+    #         lw = lw,
+    #         vp = vp,
+    #         mask_alpha=0.4,
+    #         returnfig=True
+    #     )
+    #     qpixsize = self.d.calibration.get_Q_pixel_size()
+    #     origin = self.d.calibration.get_origin_mean()
+    #     d = self.d.cal[rx,ry].data
+    #     x,y = d['qx'],d['qy']
+    #     x,y = self._transform_cal_to_pix(x,y)
+    #     ax.scatter(y,x,color=markercolor,s=markersize,marker=marker)
+    #     # if vectors were requested, add them
+    #     if vectors:
+    #         # set up vectors
+    #         crystal_inds = self.state_crystals[coord[0]][coord[1]]
+    #         crystals = [self.crystals[idx] for idx in crystal_inds]
+    #         crystals_vectors = []
+    #         for xtal in crystals:
+    #             if len(xtal)==1:
+    #                 i = xtal[0]
+    #                 x,y = self.qx[i],self.qy[i]
+    #                 x,y = self._transform_cal_to_pix(x,y)
+    #                 crystals_vectors.append(((x,y),))
+    #             elif len(xtal)==2:
+    #                 i,j = xtal[0],xtal[1]
+    #                 x1,y1 = self.qx[i],self.qy[i]
+    #                 x1,y1 = self._transform_cal_to_pix(x1,y1)
+    #                 x2,y2 = self.qx[j],self.qy[j]
+    #                 x2,y2 = self._transform_cal_to_pix(x2,y2)
+    #                 crystals_vectors.append(((x1,y1),(x2,y2)))
+    #         # set up colors
+    #         l = len(crystals_vectors)
+    #         cm = plt.get_cmap(vect_cmap)
+    #         colors = [cm(n/l) for n in range(l)]
+    #         # plot vectors
+    #         origin = self.d.calibration.get_origin_mean()
+    #         origin=tuple([x*self.upsample for x in origin])
+    #         for xtalvs,color in zip(crystals_vectors,colors):
+    #             for v in xtalvs:
+    #                 add_vector(ax,d=dict({
+    #                     'x0':origin[0],
+    #                     'y0':origin[1],
+    #                     'vx':v[0]-origin[0],
+    #                     'vy':v[1]-origin[1],
+    #                     'color':color,
+    #                     'width':vect_width,
+    #                     'head_width':vect_headsize,
+    #                 }, **vectp))
+    #         if verbose:
+    #             print(f"crystal channels: {crystals}")
+    #     # return
+    #     if returnfig:
+    #         return fig,ax
+    #     else:
+    #         plt.show()
+
+    # def show_data_mask_DP_compare(
+    #     self,
+    #     coord,
+    #     figsize=(10,5),
+    #     vp={},
+    #     c_scat='r',
+    #     s_scat=25,
+    #     sp={},
+    #     c_vor='lightcyan',
+    #     lw=0.5,
+    #     mask_color='y',
+    #     mask_alpha=0.4,
+    #     marker='x',
+    #     markercolor='blue',
+    #     markersize=100,
+    #     vectors=False,
+    #     vect_cmap='cool',
+    #     vect_width=0.5,
+    #     vect_headsize=6,
+    #     vectp={},
+    #     dpp={'scaling':'log'},
+    #     dp_rotate=0,
+    #     dp_invert=False,
+    #     returnfig=False):
+    #     """ Full comparison including the diffraction data side-by-side
+
+    #     Parameters
+    #     ----------
+    #     coord : tuple of ints
+    #         the scan coordinate
+    #     figsize : tuple
+    #     vp : dict
+    #         visualization parameters to pass to ax.show(bvm, **vp)
+    #     c_scat : color
+    #         color of voronoi maxima circles
+    #     s_scat : number
+    #         size of the voronoi maxima circles
+    #     sp : dict
+    #         vis params to pass to ax.scatter(..., **sp) for voronoi maxima circles
+    #     c_vor : color
+    #         color for voronoi edges
+    #     lw : number
+    #         linewidth for voronoi edges
+    #     mask_color : color
+    #         color for the voronoi mask
+    #     mask_alpha : number
+    #         transparency for the voronoi mask
+    #     marker : str
+    #         marker type for the data points
+    #     markercolor : color
+    #         color for the data points
+    #     markersize : number
+    #         size for the data points
+    #     vectors : bool
+    #         toggles showing crystal vectors that generated the mask
+    #     vect_cmap : colormap
+    #         the cmap used to draw vectors & differentiate if there are
+    #         multiple crystals
+    #     vect_width : number
+    #         vector width
+    #     vect_headsize : number
+    #         vector headsize
+    #     vectp : dict
+    #         param dictionary to pass to add_vector(**vp)
+    #     dpp : dict
+    #         param dictionary to pass to show(diffraction_pattern, **dpp)
+    #     dp_rotate : int
+    #         rotates the diffraction pattern by 0=none,1=pi/2,2=pi,3=3pi/2
+    #     dp_invert : bool
+    #         inverst the diffraction pattern
+    #     returnfig : bool
+    #         toggles returning the figure
+    #     """
+    #     # ensure datacube is there
+    #     assert(self._datacube is not None)
+    #     # make the figure
+    #     fig,(ax,ax2) = plt.subplots(1,2,figsize=figsize)
+    #     # show the BVM
+    #     show(self.bvm, figax=(fig,ax), **vp)
+    #     # add voronoi maxima
+    #     ax.scatter(self._qy, self._qx, s=s_scat, edgecolor=c_scat, facecolor="none", **sp)
+    #     # add voronoi edges
+    #     for region in range(len(self._voronoi_vertices)):
+    #         vertices_curr = self._voronoi_vertices[region]
+    #         if vertices_curr is not None:
+    #             for i in range(len(vertices_curr)):
+    #                 x0,y0 = vertices_curr[i,:]
+    #                 x1,y1 = vertices_curr[(i+1)%len(vertices_curr),:]
+    #                 ax.plot((y0,y1),(x0,x1),c_vor,lw=lw)
+    #     ax.set_xlim([0,self.bvm.data.shape[1]])
+    #     ax.set_ylim([0,self.bvm.data.shape[0]])
+    #     ax.invert_yaxis()
+    #     # get data and mask
+    #     rx,ry = coord
+    #     mask = self.state_masks[rx][ry]
+    #     # show voronoi mask
+    #     patches = []
+    #     for idx in mask:
+    #         vertices_curr = self._voronoi_vertices[idx]
+    #         if vertices_curr is not None:
+    #             vert = np.roll(vertices_curr,-1,1)
+    #             patches.append(Polygon(vert))
+    #     p = PatchCollection(patches,alpha=mask_alpha,color=mask_color)
+    #     ax.add_collection(p)
+    #     # transform data
+    #     qpixsize = self.d.calibration.get_Q_pixel_size()
+    #     origin = self.d.calibration.get_origin_mean()
+    #     d = self.d.cal[rx,ry].data
+    #     x,y = d['qx'],d['qy']
+    #     x,y = self._transform_cal_to_pix(x,y)
+    #     ax.scatter(y,x,color=markercolor,s=markersize,marker=marker)
+    #     # if vectors were requested, add them
+    #     if vectors:
+    #         # set up vectors
+    #         crystal_inds = self.state_crystals[coord[0]][coord[1]]
+    #         crystals = [self.crystals[idx] for idx in crystal_inds]
+    #         crystals_vectors = []
+    #         for xtal in crystals:
+    #             if len(xtal)==1:
+    #                 i = xtal[0]
+    #                 x,y = self.qx[i],self.qy[i]
+    #                 x,y = self._transform_cal_to_pix(x,y)
+    #                 crystals_vectors.append(((x,y),))
+    #             elif len(xtal)==2:
+    #                 i,j = xtal[0],xtal[1]
+    #                 x1,y1 = self.qx[i],self.qy[i]
+    #                 x1,y1 = self._transform_cal_to_pix(x1,y1)
+    #                 x2,y2 = self.qx[j],self.qy[j]
+    #                 x2,y2 = self._transform_cal_to_pix(x2,y2)
+    #                 crystals_vectors.append(((x1,y1),(x2,y2)))
+    #         # set up colors
+    #         l = len(crystals_vectors)
+    #         cm = plt.get_cmap(vect_cmap)
+    #         colors = [cm(n/l) for n in range(l)]
+    #         # plot vectors
+    #         origin = self.d.calibration.get_origin_mean()
+    #         origin=tuple([x*self.upsample for x in origin])
+    #         for xtalvs,color in zip(crystals_vectors,colors):
+    #             for v in xtalvs:
+    #                 add_vector(ax,d=dict({
+    #                     'x0':origin[0],
+    #                     'y0':origin[1],
+    #                     'vx':v[0]-origin[0],
+    #                     'vy':v[1]-origin[1],
+    #                     'color':color,
+    #                     'width':vect_width,
+    #                     'head_width':vect_headsize,
+    #                 }, **vectp))
+    #     # show diffraction pattern
+    #     dp = self._datacube[rx,ry]
+    #     if dp_invert:
+    #         dp = dp.T
+    #     if dp_rotate!=0:
+    #         dp = np.rot90(dp, k=dp_rotate)
+    #     show(dp, figax=(fig,ax2), **dpp)
+    #     # return
+    #     if returnfig:
+    #         return fig,(ax,ax2)
+    #     else:
+    #         plt.show()
+
+
+
+    ##### Setup: data channels, Voronoi tesselation, initialization  #####
+
     # Set data channels
-    def get_kpoints(self, p, vp={}, show=True, update_data_matrix=True):
+    def get_kpoints(self, p_maxima, show=True, returnfig=False, update_data_matrix=True, **vps):
         """
         Select maxima in the bragg vector map to serve as voronoi region seeds,
         i.e. defining the algorithm's partitioning of the diffraction plane.
@@ -79,16 +1371,16 @@ class VoronoiClustering(object):
 
         Parameters
         ----------
-        p : dict
+        p_maxima : dict
             parameter dict to pass to get_maxima_2D; see that methods docstring
-            (in py4DSTEM.utils)
+            (py4DSTEM.utils.get_maxima_2D)
         vp : dict
             parameter dict to pass to show when visualizing the results
         get_data_matrix : bool
             toggles updating the data channels and data matrix
         """
         # find the points
-        ans = get_maxima_2D(self.bvm.data, **p)
+        ans = get_maxima_2D(self.bvm.data, **p_maxima)
         self._qx = ans['x']
         self._qy = ans['y']
         self._int = ans['intensity']
@@ -114,12 +1406,21 @@ class VoronoiClustering(object):
         # show
         print(f"Identified {len(ans)} diffraction maxima; setting up voronoi channel data basis.")
         if show:
-            self.show_kpoints(**vp)
-            self.show_voronoi(
-                c='lightcyan',
-                lw=0.5,
-                vp=vp,
+            fig1,ax1 = self.show_bvm(
+                returnfig=True,
+                update_vps=True,
+                **vps
             )
+            fig2,ax2 = self.show_kpoints(
+                returnfig=True,
+                update_vps=True,
+                **vps
+            )
+            fig3,ax3 = self.show_voronoi(
+                returnfig=True,
+                **vps
+            )
+        # update matrix
         if update_data_matrix:
             # get the braggpeak labels
             self.get_braggpeak_labels()
@@ -140,33 +1441,16 @@ class VoronoiClustering(object):
                             )
                             ind = np.argmin(d)
                             self.X[i, r] = p["intensity"][ind]
-
-    def show_kpoints(self,returnfig=False,**vp):
-        """
-        Show the bragg vector maxima.
-
-        Parameters
-        ----------
-        returnfig : bool
-            toggle returning the figure
-        vp : dict
-            parameter dict to pass to show when visualizing the results
-        """
-        fig,ax = show_points(
-            self.bvm,
-            x=self._qx,
-            y=self._qy,
-            open_circles=True,
-            returnfig=True,
-            **vp
-        )
-        if returnfig:
-            return fig,ax
+        # return
+        if show:
+            if returnfig:
+                return (fig1,ax1),(fig2,ax2),(fig3,ax3)
+            else:
+                plt.show()
         else:
-            plt.show()
+            pass
 
-
-
+    ## Setup Voronoi data basis ##
 
     def get_braggpeak_labels(self):
         """ Gets the set of integers specifying the bragg peaks' voronoi regions
@@ -193,8 +1477,10 @@ class VoronoiClustering(object):
         self.peaklabels = braggpeak_labels
         pass
 
-    def voronoi_cooccurence_cluster(self,thresh=0.3,frac_thresh=0.1,max_iters=200,
-        n_corr_init=2,):
+    ## Initial clustering guess ##
+
+    def cooccurence_cluster(self,thresh=0.3,frac_thresh=0.1,max_iters=200,
+        n_corr_init=2,show=True,returnfig=False):
         """
         Makes an initial guess at the classes present in the dataset using
         the voronoi coccurence heuristic described in Savitzky et al. "py4DSTEM:
@@ -240,6 +1526,10 @@ class VoronoiClustering(object):
         n_corr_init : int
             seed new classes by finding maxima of the n-point joint probability
             function.  Must be 2 or 3.
+        show : bool
+            Toggle displaying the result
+        returnfig : bool
+            Toggle returning the displayed figure
         """
         if self._v:
             print('Commencing voronoi cooccurence cluster...')
@@ -370,9 +1660,20 @@ class VoronoiClustering(object):
         self.W_next = None
         self.H_next = None
         self.N_c_next = None
+        # setup mean diffraction lists
+        self._reset_mean_diffraction_list()
+        # return
         if self._v:
             print(f"Done. Found {self.N_c} classes.")
+        if show:
+            fig,ax = self.show_clustering(returnfig=True)
+            if returnfig:
+                return fig,ax
+            else:
+                plt.show()
         pass
+
+    ## Get initial clustering guess from a set of images ##
 
     def get_initial_classes_from_images(self, images):
         """
@@ -400,7 +1701,70 @@ class VoronoiClustering(object):
         self.W_next = None
         self.H_next = None
         self.N_c_next = None
+        # setup mean diffraction lists
+        self._reset_mean_diffraction_list()
         pass
+
+
+    ##### Refinement #####
+
+    def threshold_classes(self, thresh=0.25, open=0, close=0, erode=0, dilate=0):
+        """
+        Threshold all classes in real space, zeroing pixels with intensities
+        below `thresh`.  Optionally, after generating a boolean mask given
+        by `class_im >= thresh` but before multiplying by the mask, applying
+        binary opening/closing/erosion/dilation operations.
+
+        Parameters
+        ----------
+        thresh : number
+            Threshold value
+        open : integer
+            If > 1, perform a binary opening on the mask with this many
+            iterations
+        close : integer
+            If > 1, perform a binary closing on the mask with this many
+            iterations
+        erode : integer
+            If > 1, perform a binary erosion on the mask with this many
+            iterations
+        dilate : integer
+            If > 1, perform a binary dilation on the mask with this many
+            iterations
+        """
+        # Validate inputs
+        assert isinstance(open, (int, np.integer))
+        assert isinstance(close, (int, np.integer))
+        assert isinstance(erode, (int, np.integer))
+        assert isinstance(dilate, (int, np.integer))
+        # setup
+        W_next = self.W.copy()
+        H_next = self.H.copy()
+        # If no morphological operations are requested, threshold everything at once
+        if not open and not close and not erode and not dilate:
+            mask = H_next<thresh
+            H_next[mask] = 0
+            pass
+        else:
+            mask = H_next>=thresh
+            for i in range(self.N_c):
+                _mask = mask[i,:].reshape((self.R_Nx,self.R_Ny))
+                if close>0: _mask = binary_closing(_mask,iterations=close)
+                if open>0: _mask = binary_opening(_mask,iterations=open)
+                if dilate>0: _mask = binary_dilation(_mask,iterations=dilate)
+                if erode>0: _mask = binary_erosion(_mask,iterations=erode)
+                _mask = np.logical_not(_mask.ravel())
+                H_next[i,_mask] = 0
+        # update
+        self.W_next = W_next
+        self.H_next = H_next
+        self.N_c_next = self.W_next.shape[1]
+        # clear candidate mean diffraction list
+        self._reset_candidate_mean_diffraction_list()
+        pass
+
+
+
 
     def nmf(self, max_iterations=1):
         """
@@ -442,10 +1806,19 @@ class VoronoiClustering(object):
         max_iterations : int
             the maximum number of NMF steps to take
         """
-        sklearn_nmf = NMF(n_components=self.N_c, init="custom", max_iter=max_iterations)
-        self.W_next = sklearn_nmf.fit_transform(self.X, W=self.W, H=self.H)
+        sklearn_nmf = NMF(n_components=self.N_c, init="custom", max_iter=max_iterations, random_state=self._random_state)
+        try:
+            self.W_next = sklearn_nmf.fit_transform(self.X, W=self.W, H=self.H)
+        except ValueError:
+            self.W_next = sklearn_nmf.fit_transform(
+                self.X,
+                W=np.ascontiguousarray(self.W),
+                H=np.ascontiguousarray(self.H)
+            )
         self.H_next = sklearn_nmf.components_
         self.N_c_next = self.W_next.shape[1]
+        # clear candidate mean diffraction list
+        self._reset_candidate_mean_diffraction_list()
         pass
 
     def split(self, sigma=2, thresh=0.25, expand_mask=1, minimum_pixels=1):
@@ -506,10 +1879,12 @@ class VoronoiClustering(object):
                     h_i = np.zeros(self.N_meas)
                     h_i[mask.ravel()] = self.H[i, :][mask.ravel()]
                     H_next = np.vstack((H_next, h_i[np.newaxis, :]))
-        # update and exit
+        # update
         self.W_next = W_next[:, 1:]
         self.H_next = H_next[1:, :]
         self.N_c_next = self.W_next.shape[1]
+        # clear candidate mean diffraction list
+        self._reset_candidate_mean_diffraction_list()
         pass
 
     def merge(self, thresh_bragg=0.1, thresh_image=0.1, iterate=True):
@@ -549,8 +1924,15 @@ class VoronoiClustering(object):
         # loop
         while proceed:
             # Get correlation coefficients
+            # For W (peaks) use Pearson correlation
             W_corr = np.corrcoef(W_.T)
-            H_corr = np.corrcoef(H_)
+            # For H (images) we want degree of overlap
+            # Use the normalized sum of their pixelwise products
+            H_corr = np.zeros((Nc_,Nc_))
+            for i in range(Nc_):
+                for j in range(Nc_):
+                    H_corr[i,j]=H_corr[j,i] = np.sum(H_[i,:]*H_[j,:])/(np.sum(H_[i,:])+np.sum(H_[j,:]))
+            #W_corr = np.corrcoef(W_.T)
             # Get merge candidate pairs
             mask_BPs = W_corr > thresh_bragg
             mask_ScanPosition = H_corr > thresh_image
@@ -581,6 +1963,7 @@ class VoronoiClustering(object):
             merged = np.zeros(Nc_, dtype=bool)
             W_merge = np.zeros((self.N_feat, 1))
             H_merge = np.zeros((1, self.N_meas))
+            indices_merge_classes = []
             for index in range(len(merge_candidates)):
                 i = merge_candidates["i"][index]
                 j = merge_candidates["j"][index]
@@ -593,13 +1976,23 @@ class VoronoiClustering(object):
                     H_new = H_[i, :] + H_[j, :]
                     W_merge = np.hstack((W_merge, W_new[:, np.newaxis]))
                     H_merge = np.vstack((H_merge, H_new[np.newaxis, :]))
+                    indices_merge_classes.append((i,j))
                 merged[i] = True
                 merged[j] = True
             # update
             W_merge = W_merge[:, 1:]
             H_merge = H_merge[1:, :]
-            W_ = np.hstack((W_[:, merged == False], W_merge))  # noqa: E712
-            H_ = np.vstack((H_[merged == False, :], H_merge))  # noqa: E712
+            N_merge = len(indices_merge_classes)
+            assert(N_merge==W_merge.shape[1]==H_merge.shape[0])
+            print(indices_merge_classes)
+            for idx,(i,j) in enumerate(indices_merge_classes):
+                W_[:,i] = W_merge[:,idx]
+                H_[i,:] = H_merge[idx,:]
+            j_rm = [j for (i,j) in indices_merge_classes]
+            W_ = np.delete(W_,j_rm,axis=1)
+            H_ = np.delete(H_,j_rm,axis=0)
+            #W_ = np.hstack((W_[:, merged == False], W_merge))  # noqa: E712
+            #H_ = np.vstack((H_[merged == False, :], H_merge))  # noqa: E712
             Nc_ = W_.shape[1]
             # continue?
             if len(merge_candidates)==0 or not(iterate):
@@ -608,6 +2001,8 @@ class VoronoiClustering(object):
         self.W_next = W_
         self.H_next = H_
         self.N_c_next = self.W_next.shape[1]
+        # clear candidate mean diffraction list
+        self._reset_candidate_mean_diffraction_list()
         pass
 
     def merge_ij(self, i, j):
@@ -633,6 +2028,8 @@ class VoronoiClustering(object):
         self.W_next[:, i] = W_new
         self.H_next[i, :] = H_new
         self.N_c_next = self.N_c - 1
+        # clear candidate mean diffraction list
+        self._reset_candidate_mean_diffraction_list()
         return
 
     def split_i(self,i,sigma=2,thresh=0.25,expand_mask=1,erode_mask=0,
@@ -693,12 +2090,14 @@ class VoronoiClustering(object):
                 h_i = np.zeros(self.N_meas)
                 h_i[mask.ravel()] = self.H[i, :][mask.ravel()]
                 H_next = np.vstack((H_next, h_i[np.newaxis, :]))
-        # update and exit
+        # update
         W_prev = np.delete(self.W, i, axis=1)
         H_prev = np.delete(self.H, i, axis=0)
         self.W_next = np.concatenate((W_next[:, 1:], W_prev), axis=1)
         self.H_next = np.concatenate((H_next[1:, :], H_prev), axis=0)
         self.N_c_next = self.W_next.shape[1]
+        # clear candidate mean diffraction list
+        self._reset_candidate_mean_diffraction_list()
         return
 
     def remove_i(self, i):
@@ -708,14 +2107,20 @@ class VoronoiClustering(object):
         self.W_next = np.delete(self.W, i, axis=1)
         self.H_next = np.delete(self.H, i, axis=0)
         self.N_c_next = self.W_next.shape[1]
+        # clear candidate mean diffraction list
+        self._reset_candidate_mean_diffraction_list()
         return
 
     def accept(self):
         """ Update the W and H matrices with the current candidate classes.
         """
         if self.W_next is None or self.H_next is None:
+            raise Exception("The next state is missing - .W_next or .H_next is None")
             return
         else:
+            # advance mean diffraction lists
+            self._advance_mean_diffraction_lists()
+            # update
             self.W = self.W_next
             self.H = self.H_next
             self.N_c = self.N_c_next
@@ -729,6 +2134,12 @@ class VoronoiClustering(object):
         self.W_next = None
         self.H_next = None
         self.N_c_next = None
+        # clear candidate mean diffraction list
+        self._reset_candidate_mean_diffraction_list()
+        pass
+
+
+    ##### Retrieve cluster class information #####
 
     def get_class(self, i):
         """ Get class i's voronoi channel weights and image (scan position
@@ -806,727 +2217,84 @@ class VoronoiClustering(object):
     def N_meas(self):
         """ the number of scan positions """
         return self.R_Nx*self.R_Ny
+    @property
+    def datacube(self):
+        return self._datacube
 
-    # visualization
-    def show_voronoi(self,c='w',lw=1,vp={},returnfig=False):
-        # Show
-        fig,ax = show_points(
-            self.bvm,
-            x=self._qx,
-            y=self._qy,
-            open_circles=True,
-            returnfig=True,
-            **vp
-        )
-        for region in range(len(self._voronoi_vertices)):
-            vertices_curr = self._voronoi_vertices[region]
-            if vertices_curr is not None:
-                for i in range(len(vertices_curr)):
-                    x0,y0 = vertices_curr[i,:]
-                    x1,y1 = vertices_curr[(i+1)%len(vertices_curr),:]
-                    ax.plot((y0,y1),(x0,x1),c,lw=lw)
-        ax.set_xlim([0,self.bvm.data.shape[1]])
-        ax.set_ylim([0,self.bvm.data.shape[0]])
-        plt.gca().invert_yaxis()
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
 
-    def show_voronoi_mask(self,mask,mask_alpha=0.4,mask_color='y',
-        c='lightcyan',lw=0.5,vp={},returnfig=False):
-        """ mask is a list of integer (voronoi regions)
-        """
-        patches = []
-        fig,ax = self.show_voronoi(c=c,lw=lw,vp=vp,returnfig=True)
-        for idx in mask:
-            vertices_curr = self._voronoi_vertices[idx]
-            if vertices_curr is not None:
-                vert = np.roll(vertices_curr,-1,1)
-                patches.append(Polygon(vert))
-        p = PatchCollection(patches,alpha=mask_alpha,color=mask_color)
-        ax.add_collection(p)
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
+    ##### Class mean diffraction compute & storage #####
 
-    def show_data_mask_compare(self,coord,mask_alpha=0.4,mask_color='y',
-        c='lightcyan',lw=0.5,marker='x',markercolor='blue',markersize=100,
-        vectors=False,vect_cmap='cool',vect_width=0.5,vect_headsize=6,vectp={},
-        vp={},verbose=False,returnfig=False):
-        """ show the data points, mask, voronoi, bvm overlaid
-        """
-        rx,ry = coord
-        mask = self.state_masks[rx][ry]
-        # show voronoi diagram
-        fig,ax = self.show_voronoi_mask(
-            mask = mask,
-            c = c,
-            lw = lw,
-            vp = vp,
-            mask_alpha=0.4,
-            returnfig=True
-        )
-        qpixsize = self.d.calibration.get_Q_pixel_size()
-        origin = self.d.calibration.get_origin_mean()
-        d = self.d.cal[rx,ry].data
-        x,y = d['qx'],d['qy']
-        x,y = self._transform_cal_to_pix(x,y)
-        ax.scatter(y,x,color=markercolor,s=markersize,marker=marker)
-        # if vectors were requested, add them
-        if vectors:
-            # set up vectors
-            crystal_inds = self.state_crystals[coord[0]][coord[1]]
-            crystals = [self.crystals[idx] for idx in crystal_inds]
-            crystals_vectors = []
-            for xtal in crystals:
-                if len(xtal)==1:
-                    i = xtal[0]
-                    x,y = self.qx[i],self.qy[i]
-                    x,y = self._transform_cal_to_pix(x,y)
-                    crystals_vectors.append(((x,y),))
-                elif len(xtal)==2:
-                    i,j = xtal[0],xtal[1]
-                    x1,y1 = self.qx[i],self.qy[i]
-                    x1,y1 = self._transform_cal_to_pix(x1,y1)
-                    x2,y2 = self.qx[j],self.qy[j]
-                    x2,y2 = self._transform_cal_to_pix(x2,y2)
-                    crystals_vectors.append(((x1,y1),(x2,y2)))
-            # set up colors
-            l = len(crystals_vectors)
-            cm = plt.get_cmap(vect_cmap)
-            colors = [cm(n/l) for n in range(l)]
-            # plot vectors
-            origin = self.d.calibration.get_origin_mean()
-            origin=tuple([x*self.upsample for x in origin])
-            for xtalvs,color in zip(crystals_vectors,colors):
-                for v in xtalvs:
-                    add_vector(ax,d=dict({
-                        'x0':origin[0],
-                        'y0':origin[1],
-                        'vx':v[0]-origin[0],
-                        'vy':v[1]-origin[1],
-                        'color':color,
-                        'width':vect_width,
-                        'head_width':vect_headsize,
-                    }, **vectp))
-            if verbose:
-                print(f"crystal channels: {crystals}")
-        # return
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
+    def get_class_mean_diffraction(self, index, thresh=0.25, shift_center=True, subpixel=False,
+        get_next=False, overwrite=False, verbose=True):
+        """ Get the mean diffraction pattern for the class at index, using
+        the class image as a weighting mask.
 
-    def show_data_mask_DP_compare(
-        self,
-        coord,
-        figsize=(10,5),
-        vp={},
-        c_scat='r',
-        s_scat=25,
-        sp={},
-        c_vor='lightcyan',
-        lw=0.5,
-        mask_color='y',
-        mask_alpha=0.4,
-        marker='x',
-        markercolor='blue',
-        markersize=100,
-        vectors=False,
-        vect_cmap='cool',
-        vect_width=0.5,
-        vect_headsize=6,
-        vectp={},
-        dpp={'scaling':'log'},
-        dp_rotate=0,
-        dp_invert=False,
-        returnfig=False):
-        """ Full comparison including the diffraction data side-by-side
+        Class mean diffraction patterns are stored as they're computed.  If a mean diffraction
+        pattern that's already been calculated is requested again, the pre-computed array will
+        be returned.  To instead re-compute, pass `overwrite=True`. During class refinement,
+        the stored mean diffraction patterns will be deleted whenever the classes are changed.
 
         Parameters
         ----------
-        coord : tuple of ints
-            the scan coordinate
-        figsize : tuple
-        vp : dict
-            visualization parameters to pass to ax.show(bvm, **vp)
-        c_scat : color
-            color of voronoi maxima circles
-        s_scat : number
-            size of the voronoi maxima circles
-        sp : dict
-            vis params to pass to ax.scatter(..., **sp) for voronoi maxima circles
-        c_vor : color
-            color for voronoi edges
-        lw : number
-            linewidth for voronoi edges
-        mask_color : color
-            color for the voronoi mask
-        mask_alpha : number
-            transparency for the voronoi mask
-        marker : str
-            marker type for the data points
-        markercolor : color
-            color for the data points
-        markersize : number
-            size for the data points
-        vectors : bool
-            toggles showing crystal vectors that generated the mask
-        vect_cmap : colormap
-            the cmap used to draw vectors & differentiate if there are
-            multiple crystals
-        vect_width : number
-            vector width
-        vect_headsize : number
-            vector headsize
-        vectp : dict
-            param dictionary to pass to add_vector(**vp)
-        dpp : dict
-            param dictionary to pass to show(diffraction_pattern, **dpp)
-        dp_rotate : int
-            rotates the diffraction pattern by 0=none,1=pi/2,2=pi,3=3pi/2
-        dp_invert : bool
-            inverst the diffraction pattern
-        returnfig : bool
-            toggles returning the figure
-        """
-        # ensure datacube is there
-        assert(self._datacube is not None)
-        # make the figure
-        fig,(ax,ax2) = plt.subplots(1,2,figsize=figsize)
-        # show the BVM
-        show(self.bvm, figax=(fig,ax), **vp)
-        # add voronoi maxima
-        ax.scatter(self._qy, self._qx, s=s_scat, edgecolor=c_scat, facecolor="none", **sp)
-        # add voronoi edges
-        for region in range(len(self._voronoi_vertices)):
-            vertices_curr = self._voronoi_vertices[region]
-            if vertices_curr is not None:
-                for i in range(len(vertices_curr)):
-                    x0,y0 = vertices_curr[i,:]
-                    x1,y1 = vertices_curr[(i+1)%len(vertices_curr),:]
-                    ax.plot((y0,y1),(x0,x1),c_vor,lw=lw)
-        ax.set_xlim([0,self.bvm.data.shape[1]])
-        ax.set_ylim([0,self.bvm.data.shape[0]])
-        ax.invert_yaxis()
-        # get data and mask
-        rx,ry = coord
-        mask = self.state_masks[rx][ry]
-        # show voronoi mask
-        patches = []
-        for idx in mask:
-            vertices_curr = self._voronoi_vertices[idx]
-            if vertices_curr is not None:
-                vert = np.roll(vertices_curr,-1,1)
-                patches.append(Polygon(vert))
-        p = PatchCollection(patches,alpha=mask_alpha,color=mask_color)
-        ax.add_collection(p)
-        # transform data
-        qpixsize = self.d.calibration.get_Q_pixel_size()
-        origin = self.d.calibration.get_origin_mean()
-        d = self.d.cal[rx,ry].data
-        x,y = d['qx'],d['qy']
-        x,y = self._transform_cal_to_pix(x,y)
-        ax.scatter(y,x,color=markercolor,s=markersize,marker=marker)
-        # if vectors were requested, add them
-        if vectors:
-            # set up vectors
-            crystal_inds = self.state_crystals[coord[0]][coord[1]]
-            crystals = [self.crystals[idx] for idx in crystal_inds]
-            crystals_vectors = []
-            for xtal in crystals:
-                if len(xtal)==1:
-                    i = xtal[0]
-                    x,y = self.qx[i],self.qy[i]
-                    x,y = self._transform_cal_to_pix(x,y)
-                    crystals_vectors.append(((x,y),))
-                elif len(xtal)==2:
-                    i,j = xtal[0],xtal[1]
-                    x1,y1 = self.qx[i],self.qy[i]
-                    x1,y1 = self._transform_cal_to_pix(x1,y1)
-                    x2,y2 = self.qx[j],self.qy[j]
-                    x2,y2 = self._transform_cal_to_pix(x2,y2)
-                    crystals_vectors.append(((x1,y1),(x2,y2)))
-            # set up colors
-            l = len(crystals_vectors)
-            cm = plt.get_cmap(vect_cmap)
-            colors = [cm(n/l) for n in range(l)]
-            # plot vectors
-            origin = self.d.calibration.get_origin_mean()
-            origin=tuple([x*self.upsample for x in origin])
-            for xtalvs,color in zip(crystals_vectors,colors):
-                for v in xtalvs:
-                    add_vector(ax,d=dict({
-                        'x0':origin[0],
-                        'y0':origin[1],
-                        'vx':v[0]-origin[0],
-                        'vy':v[1]-origin[1],
-                        'color':color,
-                        'width':vect_width,
-                        'head_width':vect_headsize,
-                    }, **vectp))
-        # show diffraction pattern
-        dp = self._datacube[rx,ry]
-        if dp_invert:
-            dp = dp.T
-        if dp_rotate!=0:
-            dp = np.rot90(dp, k=dp_rotate)
-        show(dp, figax=(fig,ax2), **dpp)
-        # return
-        if returnfig:
-            return fig,(ax,ax2)
-        else:
-            plt.show()
-
-    def show_clustering(self,thresh=0.3,cmap='hsv',show_current=True,
-        figwidth=4,returnfig=False):
-        """ Overlay of all class images.
-        """
-        if show_current:
-            N_c = self.N_c
-        else:
-            N_c = self.N_c_next
-        cmap_base = get_cmap(cmap)
-        aspect_ratio = self.R_Ny/self.R_Nx
-        fig,ax = plt.subplots(figsize=(figwidth,figwidth/aspect_ratio))
-        ax.matshow(np.zeros((self.R_Nx,self.R_Ny)),cmap='gray')
-        for index in range(N_c):
-            if show_current:
-                class_image = self.get_class_image(index)
-            else:
-                class_image = self.get_candidate_class_image(index)
-
-            ma = np.ma.array(class_image, mask = class_image<thresh)
-            if not np.all(ma.mask):
-                colors = [(0,0,0,1),cmap_base(index/N_c)]
-                cm = LinearSegmentedColormap.from_list('cmap', colors, N=100)
-                ax.matshow(ma,cmap=cm)
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
-
-    def show_class(self,index,thresh_bragg=0.5,colorA='r',colorB='y',markersize=50,
-        show_current=True,figwidth=8,vp={},imp={},returnfig=False):
-        """ Display a single class image and BP channels.
-
-        Parameters
-        ----------
-        index : int
-            class to display
-        markersize : number
-            size of the BP markers
-        show_current : bool
-            toggle displaying current vs. next state
-        """
-        # set up plot
-        aspect_ratio1 = self.R_Ny/self.R_Nx
-        aspect_ratio2 = self.Q_Ny/self.Q_Nx
-        aspect_ratio = aspect_ratio1+aspect_ratio2
-        fig,axs = plt.subplots(1,2,figsize=(figwidth,figwidth/aspect_ratio))
-        ax1,ax2 = axs
-        # get the classes
-        if show_current:
-            class_BPs, class_image = self.get_class(index)
-        else:
-            class_BPs, class_image = self.get_candidate_class(index)
-        bps = class_BPs>thresh_bragg
-        show(self.bvm.data,figax=(fig,ax1),**vp)
-        ax1.scatter(self._qy,self._qx,edgecolor=colorA,facecolor='none',
-            s=markersize,)
-        ax1.scatter(self._qy[bps],self._qx[bps],color=colorB,
-            s=markersize,)
-        # show the image
-        show(class_image,figax=(fig,ax2),**imp)
-        # grid off
-        ax1.grid(False)
-        ax2.grid(False)
-        # exit
-        if returnfig:
-            return fig,axs
-        else:
-            plt.show()
-
-    def show_classes(self,thresh_bragg=0.5,colorA='r',colorB='y',markersize=50,
-        show_current=True,ncols=4,label=True,labeloffset=5,labelsize=24,
-        labelcolor='w',stride=1,vp={},figwidth=8,imp={},returnfig=False):
-        """
-        """
-        # get number of classes
-        if show_current:
-            N_c = self.N_c
-        else:
-            N_c = self.N_c_next
-        # set up plot
-        N_classes = N_c // stride
-        nrows = int(np.ceil((N_classes)/ncols))
-        aspect_ratio1 = self.R_Ny/self.R_Nx
-        aspect_ratio2 = self.Q_Ny/self.Q_Nx
-        aspect_ratio = aspect_ratio1+aspect_ratio2
-        fig,axs = plt.subplots(nrows,2*ncols,figsize=(figwidth*ncols,figwidth*nrows/aspect_ratio))
-        # loop over classes, get axes
-        for index in range(N_classes):
-            ax1 = axs[int(index//ncols),int(2*(index%ncols))]
-            ax2 = axs[int(index//ncols),int(2*(index%ncols)+1)]
-            # get the classes
-            if show_current:
-                class_BPs, class_image = self.get_class(index*stride)
-            else:
-                class_BPs, class_image = self.get_candidate_class(index*stride)
-            bps = class_BPs>thresh_bragg
-            show(self.bvm.data,figax=(fig,ax1),**vp)
-            ax1.scatter(self._qy,self._qx,edgecolor=colorA,facecolor='none',
-                s=markersize,)
-            ax1.scatter(self._qy[bps],self._qx[bps],color=colorB,
-                s=markersize,)
-            # show the images
-            show(class_image,figax=(fig,ax2),**imp)
-            # add label
-            if label:
-                ax1.text(labeloffset,labeloffset+labelsize/2,"{}".format(index*stride),size=labelsize,color=labelcolor)
-            # grid off
-            ax1.grid(False)
-            ax2.grid(False)
-        # remove extra axes
-        for index in range(N_classes,nrows*ncols):
-            ax1 = axs[int(index//ncols),int(2*(index%ncols))]
-            ax2 = axs[int(index//ncols),int(2*(index%ncols))+1]
-            ax1.axis('off')
-            ax2.axis('off')
-        # exit
-        if returnfig:
-            return fig,axs
-        else:
-            plt.show()
-
-    def show_class_image(self,index,show_current=True,figwidth=4,imp={},
-        returnfig=False):
-        """ Display a single class image.
-
-        Parameters
-        ----------
-        index : int
-            class to display
-        show_current : bool
-            toggle displaying current vs. next state
-        figwidth : number
-            the figure width; height is autoscaled
-        """
-        # set up plot
-        aspect_ratio = self.R_Ny/self.R_Nx
-        fig,ax = plt.subplots(figsize=(figwidth,figwidth/aspect_ratio))
-        # get the classes
-        if show_current:
-            class_image = self.get_class_image(index)
-        else:
-            class_image = self.get_candidate_class_image(index)
-        # show the image
-        show(class_image,figax=(fig,ax),**imp)
-        # grid off
-        ax.grid(False)
-        # exit
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
-
-    def show_class_images(self, show_current=True,ncols=4,label=True,labeloffset=5,
-        labelsize=24,labelcolor='w',stride=1,vp={},figwidth=8,imp={},
-        returnfig=False):
-        """
-        """
-        # get number of classes
-        if show_current:
-            N_c = self.N_c
-        else:
-            N_c = self.N_c_next
-        # set up plot
-        N_classes = N_c // stride
-        nrows = int(np.ceil((N_classes)/ncols))
-        aspect_ratio = self.R_Ny/self.R_Nx
-        fig,axs = plt.subplots(nrows,ncols,figsize=(figwidth*ncols,figwidth*nrows/aspect_ratio))
-        # loop over classes, get axes
-        for index in range(N_classes):
-            ax = axs[int(index//ncols),int(index%ncols)]
-            # get the classes
-            if show_current:
-                class_image = self.get_class_image(index*stride)
-            else:
-                class_image = self.get_candidate_class_image(index*stride)
-            # show the images
-            show(class_image,figax=(fig,ax),**imp)
-            # add label
-            if label:
-                ax.text(labeloffset,labeloffset+labelsize/2,"{}".format(index*stride),size=labelsize,color=labelcolor)
-            # grid off
-            ax.grid(False)
-        # remove extra axes
-        for index in range(N_classes,nrows*ncols):
-            ax = axs[int(index//ncols),int(index%ncols)]
-            ax.axis('off')
-        # exit
-        if returnfig:
-            return fig,axs
-        else:
-            plt.show()
-
-    def show_class_channel(self,index,thresh_bragg=0.5,colorA='r',colorB='y',markersize=50,
-        show_current=True,figwidth=8,vp={},imp={},returnfig=False):
-        """ Display a single class BP channels.
-
-        Parameters
-        ----------
-        index : int
-            class to display
-        markersize : number
-            size of the BP markers
-        show_current : bool
-            toggle displaying current vs. next state
-        """
-        # set up plot
-        aspect_ratio = self.Q_Ny/self.Q_Nx
-        fig,ax = plt.subplots(figsize=(figwidth,figwidth*aspect_ratio))
-        # get the classes
-        if show_current:
-            class_BPs = self.get_class_BPs(index)
-        else:
-            class_BPs = self.get_candidate_class_BPs(index)
-        bps = class_BPs>thresh_bragg
-        show(self.bvm.data,figax=(fig,ax),**vp)
-        ax.scatter(self._qy,self._qx,edgecolor=colorA,facecolor='none',
-            s=markersize,)
-        ax.scatter(self._qy[bps],self._qx[bps],color=colorB,
-            s=markersize,)
-        # grid off
-        ax.grid(False)
-        # exit
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
-
-    def show_class_channels(self,thresh_bragg=0.5,colorA='r',colorB='y',
-        markersize=50,show_current=True,ncols=4,label=True,labeloffset=5,
-        labelsize=24,labelcolor='w',stride=1,vp={},figwidth=8,imp={},
-        returnfig=False):
-        """
-        """
-        # get number of classes
-        if show_current:
-            N_c = self.N_c
-        else:
-            N_c = self.N_c_next
-        # set up plot
-        N_classes = N_c // stride
-        nrows = int(np.ceil((N_classes)/ncols))
-        aspect_ratio = self.Q_Ny/self.Q_Nx
-        fig,axs = plt.subplots(nrows,ncols,figsize=(figwidth*ncols,figwidth*nrows/aspect_ratio))
-        # loop over classes, get axes
-        for index in range(N_classes):
-            ax = axs[int(index//ncols),int(index%ncols)]
-            # get the classes
-            if show_current:
-                class_BPs = self.get_class_BPs(index*stride)
-            else:
-                class_BPs = self.get_candidate_class_BPs(index*stride)
-            # show the class peaks
-            bps = class_BPs>thresh_bragg
-            show(self.bvm.data,figax=(fig,ax),**vp)
-            ax.scatter(self._qy,self._qx,edgecolor=colorA,facecolor='none',
-                s=markersize,)
-            ax.scatter(self._qy[bps],self._qx[bps],color=colorB,
-                s=markersize,)
-            # add label
-            if label:
-                ax.text(labeloffset,labeloffset+labelsize/2,"{}".format(index*stride),size=labelsize,color=labelcolor)
-            # grid off
-            ax.grid(False)
-        # remove extra axes
-        for index in range(N_classes,nrows*ncols):
-            ax = axs[int(index//ncols),int(index%ncols)]
-            ax.axis('off')
-        # exit
-        if returnfig:
-            return fig,axs
-        else:
-            plt.show()
-
-
-    def show_DP_channel(self,pos,thresh_bragg=0.5,colorA='r',colorB='y',markersize=50,
-        figwidth=8,vp={},imp={},returnfig=False):
-        """ Display a single class BP channels.
-
-        Parameters
-        ----------
-        pos : (int,int)
-            (rx,ry) position to display
-        markersize : number
-            size of the BP markers
-        show_current : bool
-            toggle displaying current vs. next state
-        """
-        # set up plot
-        aspect_ratio = self.Q_Ny/self.Q_Nx
-        fig,ax = plt.subplots(figsize=(figwidth,figwidth*aspect_ratio))
-        # get peaks
-        r = pos[0]*self.R_Ny + pos[1]
-        BPs = self.X[:,r]
-        bps = BPs>thresh_bragg
-        show(self.bvm.data,figax=(fig,ax),**vp)
-        ax.scatter(self._qy,self._qx,edgecolor=colorA,facecolor='none',
-            s=markersize,)
-        ax.scatter(self._qy[bps],self._qx[bps],color=colorB,
-            s=markersize,)
-        # grid off
-        ax.grid(False)
-        # exit
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
-
-
-    def show_clustering_selected(self, indices, thresh=0.3, cmap='hsv', show_current=True,
-        scalesize=4,figsize=(8,8),returnfig=True):
-        """ Display class image overlays in N_c plots, adding classes one by one in
-        each successive plot.
-
-        Parameters
-        ----------
-        indices : list of ints
-            classes to display
+        index : integer
+            The class index
         thresh : number
-            min display intensity
-        cmap : colormap
-        show_current : bool
-            toggles showing the current vs. next state
-        ncols : int
-            number of display columns
-        label : bool
-            toggles display of the class index
-        labeloffset : number
-            label offset from the plot corner
-        labelsize : number
-            label size
-        labelcolor : color
-        stride : int
-            display only every stride images
-        scalesize : number
-            scale the figure size
-        figsize : 2-tuple
-            figure size
-        returnfig : bool
-            toggle returning the figure
+            Only include image pixels with intensities above this value
+        shift_center : bool
+            Toggle shifting the centers for descan correction
+        subpixel : bool
+            Toggle subpixel center shifts
+        get_next : bool
+            If True, compute candidate (rather than current) class diffraction
+        overwrite : bool
+            If set to True, if this mean has already been computed, overwrite it
+            instead of returning the existing value.
+        verbose : bool
+            Toggle verbosity
+
+        Returns
+        -------
+        (2d numpy array) : the mean diffraction from the class
         """
-        if show_current:
-            N_c = self.N_c
+        # has the requested data already been computed? if so, return it
+        dp = self._class_mean_diffraction[index] if not get_next else self._candidate_class_mean_diffraction[index]
+        if dp is not None and not overwrite:
+            return dp
+        # get class image
+        im = self.get_class_image(index) if not get_next else self.get_candidate_class_image(index)
+        # threshold
+        im = im.copy()
+        im[im<=thresh] = 0
+        # get class diffraction
+        dp = self.datacube.get_virtual_diffraction(
+            'mean',
+            mask=im,
+            shift_center=shift_center,
+            subpixel=subpixel,
+            verbose=verbose,
+        ).data
+        # store it
+        if not get_next:
+            self._class_mean_diffraction[index] = dp
         else:
-            N_c = self.N_c_next
-        cmap_base = get_cmap(cmap)
-        fig,ax = plt.subplots(figsize=figsize)
-        ax.matshow(np.zeros((self.R_Nx,self.R_Ny)),cmap='gray')
-        for index in (indices):
-            if show_current:
-                class_image = self.get_class_image(index)
-            else:
-                class_image = self.get_candidate_class_image(index)
-
-            ma = np.ma.array(class_image, mask = class_image<thresh)
-            if not np.all(ma.mask):
-                colors = [(0,0,0,1),cmap_base(index/N_c)]
-                cm = LinearSegmentedColormap.from_list('cmap', colors, N=100)
-                ax.matshow(ma,cmap=cm)
+            self._candidate_class_mean_diffraction[index] = dp
         # return
-        if returnfig:
-            return fig,ax
-        else:
-            plt.show()
-
-    def show_clustering_accum(self, thresh=0.3, cmap='hsv', show_current=True,
-        ncols=1,label=True, labeloffset=5, labelsize=24, labelcolor='w', stride=1,
-        scalesize=4,returnfig=False):
-        """ Display class image overlays in N_c plots, adding classes one by one in
-        each successive plot.
-
-        Parameters
-        ----------
-        thresh : number
-            min display intensity
-        cmap : colormap
-        show_current : bool
-            toggles showing the current vs. next state
-        ncols : int
-            number of display columns
-        label : bool
-            toggles display of the class index
-        labeloffset : number
-            label offset from the plot corner
-        labelsize : number
-            label size
-        labelcolor : color
-        stride : int
-            display only every stride images
-        scalesize : number
-            scale the figure size
-        """
-        if show_current:
-            N_c = self.N_c
-        else:
-            N_c = self.N_c_next
-        N_classes = N_c//stride
-        ncols = int(ncols)
-        nrows = int(np.ceil(N_classes/ncols))
-        cmap_base = get_cmap(cmap)
-        aspect_ratio = self.R_Ny/self.R_Nx
-        fig,axs = plt.subplots(nrows,ncols,
-            figsize=(scalesize*ncols,scalesize*nrows/aspect_ratio))
-        for i in range(N_classes):
-            if ncols==1:
-                ax = axs[i]
-            else:
-                ax = axs[i//ncols,i%ncols]
-            ax.matshow(np.zeros((self.R_Nx,self.R_Ny)),cmap='gray')
-            for index in np.arange(i*stride+1):
-                if show_current:
-                    class_image = self.get_class_image(index)
-                else:
-                    class_image = self.get_candidate_class_image(index)
-
-                ma = np.ma.array(class_image, mask = class_image<thresh)
-                if not np.all(ma.mask):
-                    colors = [(0,0,0,1),cmap_base(index/N_c)]
-                    cm = LinearSegmentedColormap.from_list('cmap', colors, N=100)
-                    ax.matshow(ma,cmap=cm)
-            if label:
-                ax.text(labeloffset,labeloffset+labelsize/2,"{}".format(index),size=labelsize,color=labelcolor)
-        # remove excess axes
-        for i in range(N_classes,ncols*nrows):
-            ax = axs[i//ncols,i%ncols]
-            ax.axis('off')
-        # return
-        if returnfig:
-            return fig,axs
-        else:
-            plt.show()
+        return dp
 
 
+    ## Tracking & storing mean diffraction images ##
 
+    def _reset_mean_diffraction_list(self):
+        self._class_mean_diffraction = [None for i in range(self.N_c)]
+        pass
 
+    def _reset_candidate_mean_diffraction_list(self):
+        self._candidate_class_mean_diffraction = [None for i in range(self.N_c_next)]
+        pass
 
-
-
-
-
-
-
-
-
-
-
-
-
-
+    def _advance_mean_diffraction_lists(self):
+        self._class_mean_diffraction = self._candidate_class_mean_diffraction
+        self._reset_candidate_mean_diffraction_list()
+        pass
 
 
