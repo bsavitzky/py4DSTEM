@@ -21,7 +21,9 @@ def get_bksbtr_DP(datacube, darkref, Rx, Ry):
         datacube.Q_Nx,
         datacube.Q_Ny,
     ), "background must have shape (datacube.Q_Nx, datacube.Q_Ny)"
-    return datacube.data[Rx, Ry, :, :].astype(float) - darkref.astype(float)
+    x = datacube.data[Rx, Ry, :, :].astype(float) - darkref.astype(float)
+    x = np.maximum(x,0)
+    return x
 
 
 #### Get dark reference ####
